@@ -26,7 +26,7 @@ chapter.md
 = 已经完成源码级深挖的核心题
 ```
 
-因此目前不能把“01～07 已迁入仓库”等同于“01～07 已全部深度完成”。详细状态见：
+详细状态：
 
 - [01～07 深度重构状态](docs/deep-rewrite-status-01-07.md)
 - [Pi × nanobot × AgentDock × OpenViking 项目案例对照](docs/project-case-map.md)
@@ -50,7 +50,7 @@ chapter.md
 
 ## 真实项目案例基线
 
-后续 01～07 的深度回答优先结合以下四个真实项目，而不是只写抽象理论：
+后续 01～07 的深度回答优先结合以下四个真实项目：
 
 ```text
 Pi
@@ -66,12 +66,13 @@ OpenViking
 └─ Context Database / Memory / Resource / Skill / L0-L1-L2 / Retrieval Trajectory
 ```
 
-不会机械地每题都写四个项目，而是按题目选最合适的案例。例如：
+不会机械地每题都写四个项目，而是按题目选最合适的案例：
 
-- Tool Recovery：重点看 **Pi + nanobot**
-- 多租户 / 多实例：重点看 **AgentDock**
-- Context / Memory / Retrieval：重点看 **OpenViking + nanobot + Pi**
-- Harness / Trace：重点看 **Pi + nanobot + AgentDock + OpenViking retrieval trajectory**
+- Tool Recovery：**Pi + nanobot**
+- 多租户 / 多实例：**AgentDock**
+- Context / Memory / Retrieval：**OpenViking + nanobot + Pi**
+- Harness / Trace：**Pi + nanobot + AgentDock + OpenViking retrieval trajectory**
+- Security：**nanobot Workspace/SSRF + Pi Sandbox 边界 + AgentDock Container/Egress**
 
 ## 当前目录
 
@@ -92,46 +93,46 @@ agent-interview/
 └── docs/                                # 项目对照、重构状态、维护规则
 ```
 
-## 已经迁入并维护的主章节
-
-目前 01～12 主章节已经全部进入仓库维护。其中：
-
-- **01～07：全集题库已经迁入，部分核心题已经做成 Deep Dive，但仍在逐题深度重构。**
-- **08～12：已按新的更深标准重新整理。**
-
 ## 已升级为独立 Deep Dive 的核心题
 
 ### 01 Agent Runtime
 
 - [Agent Loop 深挖](01-agent-runtime/agent-loop-deep-dive.md)
 - [Parallel Tool Calling：并行工具调用、依赖链与超时调度](01-agent-runtime/parallel-tool-calling.md)
+- [Runtime、Control Plane、Context Database 与业务事实边界](01-agent-runtime/runtime-platform-context-boundaries-deep-dive.md)
 
 ### 02 Planning / Routing / Multi-Agent
 
 - [Model Routing 深挖](02-planning-routing-multi-agent/model-routing-deep-dive.md)
 - [ReAct、Plan-and-Execute、DAG 深挖](02-planning-routing-multi-agent/react-plan-dag-deep-dive.md)
+- [Multi-Agent State Sharing：Planner/Worker/Reviewer、Artifact、Replan](02-planning-routing-multi-agent/multi-agent-state-sharing-deep-dive.md)
 
 ### 03 Tool / MCP
 
 - [Tool Schema 与 Tool Runtime 深挖](03-tools-mcp/tool-schema-runtime-deep-dive.md)
 - [MCP Runtime 深挖](03-tools-mcp/mcp-runtime-deep-dive.md)
+- [Tool Permission / Policy：RBAC、Scope、Sandbox、业务授权](03-tools-mcp/tool-permission-policy-deep-dive.md)
 
 ### 04 Reliability / Security
 
 - [nanobot Recovery 深挖](04-reliability-security/nanobot-recovery-deep-dive.md)
 - [Tool Failure、幂等、UNKNOWN 深挖](04-reliability-security/tool-failure-idempotency-deep-dive.md)
+- [Prompt Injection、Sandbox 与不可绕过安全边界](04-reliability-security/prompt-injection-sandbox-deep-dive.md)
 
 ### 05 Context / Memory
 
 - [Context Engineering 深挖](05-context-memory/context-engineering-deep-dive.md)
+- [Session、Memory、Runtime State 与业务 State 的边界](05-context-memory/memory-session-state-deep-dive.md)
 
-### 06 RAG / Text-to-SQL
+### 06 RAG / Retrieval
 
 - [Text-to-SQL 深挖：300+ 表、复杂 JOIN、权限和性能](06-rag-retrieval/text-to-sql-deep-dive.md)
+- [Hybrid Search、RRF、ReRank 与 OpenViking Context Database](06-rag-retrieval/hybrid-search-rerank-context-db-deep-dive.md)
 
 ### 07 Harness / Eval / Trace
 
 - [Agent Eval + Trace + Replay 深挖](07-harness-eval-trace/eval-trace-deep-dive.md)
+- [Harness 到底是什么：Pi、nanobot、AgentDock、OpenViking 对照](07-harness-eval-trace/harness-runtime-comparison-deep-dive.md)
 
 ### 08 Java / Spring
 
@@ -154,29 +155,31 @@ agent-interview/
 
 - [公司偏好与面试表达策略](12-interview-strategy/chapter.md)
 
-## 学习顺序
+## 推荐学习主线
 
-建议不要从头背 159 题，先把下面这条主链打通：
+不要从头背题，先把下面这条运行链打通：
 
 ```text
+Runtime / Platform Boundary
+   ↓
 Agent Loop
    ↓
-Context Engineering
+Context / Session / Memory
    ↓
-Tool Runtime / MCP
+Tool Runtime / MCP / Permission
    ↓
-Recovery / 幂等 / UNKNOWN
+Recovery / UNKNOWN / Sandbox
    ↓
-Planning / Model Routing / Multi-Agent
+Planning / Multi-Agent / Replan
    ↓
-RAG / Text-to-SQL
+RAG / Hybrid / Text-to-SQL
    ↓
 Harness / Trace / Eval
    ↓
 Java / Spring 工程化
 ```
 
-然后再回到各章 `chapter.md` 做题目覆盖。
+然后再回到各章 `chapter.md` 做覆盖。
 
 ## 回答质量检查
 
@@ -205,8 +208,6 @@ Runtime 如何做硬约束？
 真实项目为什么这样设计？
 ```
 
-这些问题能回答清楚，才算真正掌握。
-
 ---
 
-后续维护规则：新题先语义去重；重复题优先深化现有文章，不新增同义文件；核心题逐步从 `chapter.md` 升级成独立 Deep Dive。01～07 在全部核心题完成深度重构之前，不标记“已全部深度完成”。
+后续维护规则：新题先语义去重；重复题优先深化现有文章；核心题逐步从 `chapter.md` 升级为独立 Deep Dive。01～07 在核心题都能指向深度正文之前，不标记“已全部深度完成”。
