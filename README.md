@@ -42,36 +42,71 @@ agent-interview/
 ├── 05-context-memory/                   # Context、Session、Memory、Compaction
 ├── 06-rag-retrieval/                    # Chunk、Hybrid、RRF、ReRank、Text-to-SQL
 ├── 07-harness-eval-trace/               # Harness、Trace、Eval、Golden Set、Replay
-├── 08-java-engineering/                 # Spring、线程池、Redis、WebSocket、OTel
-├── 09-model-training/                   # SFT、Router、量化、推理模型
-├── 10-code-agent/                       # Code Agent、AST/LSP、测试生成
-├── 11-project-productization/           # 项目拷打、Demo→Production、多租户平台
-├── 12-interview-strategy/               # 高频题、不同轮次、表达策略
-└── interview-index/                     # 复习路线与索引
+├── 08-java-engineering/                 # Spring、线程池、Redis、WebSocket、数据库
+├── 09-model-training/                   # SFT、LoRA、DPO/GRPO、MoE、KV Cache
+├── 10-code-agent/                       # Code Agent、AST/LSP、测试生成、Sandbox
+├── 11-project-productization/           # 项目拷打、Demo→Production、平台化
+└── 12-interview-strategy/               # 公司偏好、学习方法、面试表达
 ```
 
-## 已升级为源码级 Deep Dive 的核心题
+## 已经迁入并维护的主章节
 
-### Agent Runtime
+目前 01～12 主章节已经全部进入仓库维护。其中 01～07 保留原始全集题库 `chapter.md`，08～12 已按新的更深标准重新整理，不再只做提纲式迁移。
 
-- [Agent Loop 深挖：一次用户消息到底如何经过 Context、Tool、Checkpoint 与停止条件](01-agent-runtime/agent-loop-deep-dive.md)
+## 已升级为独立 Deep Dive 的核心题
+
+### 01 Agent Runtime
+
+- [Agent Loop 深挖](01-agent-runtime/agent-loop-deep-dive.md)
 - [Parallel Tool Calling：并行工具调用、依赖链与超时调度](01-agent-runtime/parallel-tool-calling.md)
 
-### Planning / Routing
+### 02 Planning / Routing / Multi-Agent
 
-- [Model Routing 深挖：简单/复杂问题如何分流，并在运行时动态升级](02-planning-routing-multi-agent/model-routing-deep-dive.md)
+- [Model Routing 深挖](02-planning-routing-multi-agent/model-routing-deep-dive.md)
+- [ReAct、Plan-and-Execute、DAG 深挖](02-planning-routing-multi-agent/react-plan-dag-deep-dive.md)
 
-### Tool Runtime
+### 03 Tool / MCP
 
-- [Tool Schema 与 Tool Runtime 深挖：为什么 JSON Schema 正确仍然可能执行错](03-tools-mcp/tool-schema-runtime-deep-dive.md)
+- [Tool Schema 与 Tool Runtime 深挖](03-tools-mcp/tool-schema-runtime-deep-dive.md)
+- [MCP Runtime 深挖](03-tools-mcp/mcp-runtime-deep-dive.md)
 
-### Reliability
+### 04 Reliability / Security
 
-- [nanobot Recovery 深挖：Checkpoint、UNKNOWN Tool 与副作用一致性](04-reliability-security/nanobot-recovery-deep-dive.md)
+- [nanobot Recovery 深挖](04-reliability-security/nanobot-recovery-deep-dive.md)
+- [Tool Failure、幂等、UNKNOWN 深挖](04-reliability-security/tool-failure-idempotency-deep-dive.md)
 
-### Context Engineering
+### 05 Context / Memory
 
-- [Context Engineering 深挖：Durable Transcript、Model-facing Context 与动态压缩](05-context-memory/context-engineering-deep-dive.md)
+- [Context Engineering 深挖](05-context-memory/context-engineering-deep-dive.md)
+
+### 06 RAG / Text-to-SQL
+
+- [Text-to-SQL 深挖：300+ 表、复杂 JOIN、权限和性能](06-rag-retrieval/text-to-sql-deep-dive.md)
+
+### 07 Harness / Eval / Trace
+
+- [Agent Eval + Trace + Replay 深挖](07-harness-eval-trace/eval-trace-deep-dive.md)
+
+### 08 Java / Spring
+
+- [Java / Spring / 并发与平台工程主章节](08-java-engineering/chapter.md)
+- [Agent Streaming / WebSocket 协议深挖](08-java-engineering/streaming-websocket-deep-dive.md)
+
+### 09 模型 / 训练
+
+- [模型、训练、路由与推理优化主章节](09-model-training/chapter.md)
+
+### 10 Code Agent
+
+- [AI Coding / Code Agent / 自动测试主章节](10-code-agent/chapter.md)
+
+### 11 项目 / 产品化
+
+- [项目拷打、业务落地与产品化](11-project-productization/chapter.md)
+
+### 12 面试表达
+
+- [公司偏好与面试表达策略](12-interview-strategy/chapter.md)
 
 ## 学习顺序
 
@@ -95,7 +130,7 @@ Harness / Trace / Eval
 Java / Spring 工程化
 ```
 
-然后再回到 `chapter.md` 做题目覆盖。
+然后再回到各章 `chapter.md` 做题目覆盖。
 
 ## 回答质量检查
 
@@ -127,4 +162,4 @@ Runtime 如何做硬约束？
 
 ---
 
-后续维护规则：新题先语义去重；重复题优先深化现有文章，不新增同义文件；核心题逐步从 `chapter.md` 升级成独立 Deep Dive。
+后续维护规则：新题先语义去重；重复题优先深化现有文章，不新增同义文件；核心题逐步从 `chapter.md` 升级成独立 Deep Dive。下一批优先深化 Multi-Agent State Sharing、Memory/Session、Hybrid Search/ReRank、Spring Agent 集成、Sandbox 和 Tool Permission。
