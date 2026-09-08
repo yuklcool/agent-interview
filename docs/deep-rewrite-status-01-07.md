@@ -1,136 +1,194 @@
-# 01～07 深度重构状态
+# 01～07 深度重构完成报告
 
-> 结论：01～07 **不是完全没有深度整理**，而是“全集题库已迁入，核心题正在逐步升级成源码级 Deep Dive”。`chapter.md` 仍然保留去重全集和早期答案，但不再视为最终权威答案。
+> 状态：**COMPLETE**。01～07 原有 104 道核心题已经全部完成全量深度重构。
 
-## 当前状态
+原来的 `chapter.md` / `part-*.md` 继续保留作为题目全集、历史版本和快速复习入口；每章新的 `deep-complete.md` 作为当前权威学习版本。已有的单专题 `*-deep-dive.md` 继续保留，用于对少数重点问题做更细的源码级展开。
 
-| 章节 | 当前状态 | 已有 Deep Dive | 下一步继续补 |
-|---|---|---|---|
-| 01 Agent Runtime | 持续深化 | Agent Loop、Parallel Tool Calling、Runtime/Platform/Context Boundary | Stop/Iteration、Framework 选型、长任务 Run Lifecycle |
-| 02 Planning / Routing / Multi-Agent | 持续深化 | Model Routing、ReAct/Plan/DAG、Multi-Agent State Sharing/Replan | Handoff、Planner/Reviewer 失败归因、复杂任务取消 |
-| 03 Tools / MCP | 持续深化 | Tool Schema Runtime、MCP Runtime、Tool Permission/Policy | Tool Discovery、Skill、Progressive Disclosure、Structured Output |
-| 04 Reliability / Security | 持续深化 | nanobot Recovery、Tool Failure/Idempotency、Prompt Injection/Sandbox | HITL、Secret、Risk Gate、业务补偿/Saga |
-| 05 Context / Memory | 持续深化 | Context Engineering、Memory/Session/State | Memory Admission、Conflict、Topic Switch、Memory Eval |
-| 06 RAG / Retrieval | 持续深化 | Text-to-SQL、Hybrid/RRF/ReRank/Context Database | Query Rewrite、Parent-Child、Graph/Relation Retrieval、RAG Eval |
-| 07 Harness / Eval / Trace | 持续深化 | Eval/Trace/Replay、Harness Runtime Comparison | Golden Dataset、Tool Mock、A/B、Failure Attribution、Release Gate |
+## 完成度
 
-## 本轮已经补齐的核心薄弱点
+| 章节 | 题数 | 状态 | 权威深度版 |
+|---|---:|---|---|
+| 01 Agent Runtime / Loop / 系统边界 | 16 | ✅ 16/16 | [deep-complete.md](../01-agent-runtime/deep-complete.md) |
+| 02 Planning / Routing / Multi-Agent | 14 | ✅ 14/14 | [deep-complete.md](../02-planning-routing-multi-agent/deep-complete.md) |
+| 03 Tool / Function Calling / MCP / Skills | 17 | ✅ 17/17 | [deep-complete.md](../03-tools-mcp/deep-complete.md) |
+| 04 Reliability / Security / Recovery | 12 | ✅ 12/12 | [deep-complete.md](../04-reliability-security/deep-complete.md) |
+| 05 Context / Memory / Session / State | 11 | ✅ 11/11 | [deep-complete.md](../05-context-memory/deep-complete.md) |
+| 06 RAG / Retrieval / Knowledge Base | 17 | ✅ 17/17 | [deep-complete.md](../06-rag-retrieval/deep-complete.md) |
+| 07 Harness / Eval / Trace | 17 | ✅ 17/17 | [deep-complete.md](../07-harness-eval-trace/deep-complete.md) |
+| **合计** | **104** | **✅ 104/104** | |
 
-这一轮不再只扩 `chapter.md`，而是新增了 7 个源码/架构级专题：
+## 这次“完成”指什么
 
-```text
-01-agent-runtime/
-└── runtime-platform-context-boundaries-deep-dive.md
-
-02-planning-routing-multi-agent/
-└── multi-agent-state-sharing-deep-dive.md
-
-03-tools-mcp/
-└── tool-permission-policy-deep-dive.md
-
-04-reliability-security/
-└── prompt-injection-sandbox-deep-dive.md
-
-05-context-memory/
-└── memory-session-state-deep-dive.md
-
-06-rag-retrieval/
-└── hybrid-search-rerank-context-db-deep-dive.md
-
-07-harness-eval-trace/
-└── harness-runtime-comparison-deep-dive.md
-```
-
-这些专题统一使用 **Pi × nanobot × AgentDock × OpenViking** 做真实项目对照，但不会机械地四个项目都写一遍，而是按职责选择案例：
-
-- **Pi**：durable Harness、Session/Operation State、intent/effect/settlement、replay policy；
-- **nanobot**：AgentRunner、Context Governance、Tool Execution、Subagent、Injection、Workspace Scope、Recovery；
-- **AgentDock**：Control Plane、多租户、多实例容器、Driver、Task/Event、Sandbox/Egress；
-- **OpenViking**：Context Database、Memory/Resource/Skill、L0/L1/L2、recursive retrieval、retrieval trajectory。
-
-## 重构规则
-
-以后 `chapter.md` 的作用固定为：
+不是把旧答案简单扩写，而是把每章重新按工程主线组织。重点问题已经从“概念解释”推进到以下层次：
 
 ```text
-题目全集
-+ 去重后的快速答案
-+ 指向 Deep Dive 的入口
+问题的工程本质
+      ↓
+核心设计判断
+      ↓
+真实运行链路
+      ↓
+State / ID / Version / Status
+      ↓
+失败路径与收敛状态
+      ↓
+真实项目实现对照
+      ↓
+项目当前能力 vs 企业扩展
+      ↓
+Java / Spring / Domain Service 落地
+      ↓
+权限 / 恢复 / 并发 / 成本 / Trace / Eval
+      ↓
+二面、三面继续追问
 ```
 
-真正的学习主文档由独立 Deep Dive 承担。
+## 四个项目在 01～07 中的角色
 
-### 每道核心题最低完成标准
+### Pi
 
-1. 给出问题的工程本质，而不是定义。
-2. 画出真实执行链或状态机。
-3. 定义关键数据结构和状态字段。
-4. 解释异常路径和最终收敛状态。
-5. 对照真实项目源码/架构。
-6. 明确“项目已有能力”和“建议扩展能力”。
-7. 讲 Trade-off，不写万能最佳实践。
-8. 给 Java / Agent 平台落地方式。
-9. 给二次、三次追问。
-10. 最后才给 1～2 分钟口述版。
+主要用于解释：
 
-## 不再允许的答案模式
+- Agent Runtime 与 Harness 的区别；
+- Session / Branch / AgentLane；
+- durable operation state；
+- effect intent → uncertain effect → settlement；
+- replay policy；
+- crash recovery；
+- 为什么 Harness 不能承诺外部 exactly-once。
 
-下面这种答案后续仍视为待重构：
+重点章节：01、04、05、07。
+
+### nanobot
+
+主要用于解释当前真实轻量 Runtime：
+
+- `AgentLoop` / `AgentRunner` / `AgentRunSpec`；
+- `ContextGovernor`；
+- `ToolRegistry` / `execute_tool_calls`；
+- `concurrency_safe` 与并发 Tool batch；
+- `SubagentManager`；
+- user injection；
+- runtime checkpoint / recovery；
+- workspace scope / SSRF boundary；
+- `AgentHook` instrumentation seam。
+
+重点章节：01～05、07。
+
+### AgentDock
+
+主要用于解释 Runtime 上层的平台能力：
+
+- tenant / workspace；
+- agent/container 生命周期；
+- driver registry；
+- task / event stream；
+- persistent workspace；
+- MCP / Skill assignment；
+- credentials；
+- Docker resource isolation；
+- egress proxy；
+- snapshot / recovery；
+- 多 Runtime 的统一 Control Plane。
+
+重点章节：01～04、07。
+
+### OpenViking
+
+主要用于解释 Context / Memory / Retrieval：
+
+- `viking://`；
+- Resource / Memory / Skill；
+- L0 Abstract / L1 Overview / L2 Detail；
+- directory recursive retrieval；
+- retrieval trajectory；
+- Session → long-term memory；
+- Progressive Disclosure；
+- Context Database 与传统平面向量库的差别。
+
+重点章节：03、05、06、07。
+
+## 各章已经解决的核心深度问题
+
+### 01 Agent Runtime
+
+已经覆盖 Model ≠ Agent、Agent Loop、CoT/ReAct/ToT、Agent vs Workflow、Planner/Executor contract、Plan 震荡、停止条件、带环 Graph、Harness vs Model Training、Control Plane / Runtime / Context / Business State 分层。
+
+### 02 Planning / Multi-Agent
+
+已经覆盖混合 Intent Router、最小澄清、任务依赖图、ReAct + Plan-and-Execute 混合、Router/Planner/Worker/Reviewer 边界、required/optional Worker、plan_version、用户中途改口、Model Routing、Subagent 拆分、Handoff contract、死循环防护、MCP vs A2A、Shared State / Artifact / Event 通信。
+
+### 03 Tool / MCP / Skill
+
+已经覆盖 JSON Schema、业务语义校验、Tool 可见性 vs 执行权限、MCP 迁移、参数自动修复、100+ Tool Retrieval、Progressive Disclosure、HTTP 200 但业务失败、Canonical ToolResult、MCP Host/Client/Server、CLI/REST/MCP 选择、Execution Graph、Rule/Skill/Tool 边界、Skill Registry、Function Calling SFT 前的工程优化。
+
+### 04 Reliability / Security
+
+已经覆盖业务 UNKNOWN、nanobot/Pi recovery 对照、Retry ownership、precondition、删除/退款等高风险防护、Prompt Injection、Workspace/Sandbox/SSRF、Tool Failure taxonomy、Reflection no-progress、预算继承、NL2SQL 七层安全、HITL action hash、全链路 hallucination taxonomy。
+
+### 05 Context / Memory / Session
+
+已经彻底区分 Durable Transcript、Runtime State、Long-term Memory、Model-facing Context、Business State，并覆盖 compaction、跨 Agent handoff、关键约束、防摘要失真、Rolling/Segment Summary、Memory Admission、Memory Retrieval Gate、Topic Switch、Memory Conflict、Memory Hallucination。
+
+### 06 RAG / Retrieval
+
+已经覆盖结构化 Chunk、Hybrid Search、RRF、ReRank 指标、知识版本热更新、Embedding 选型/迁移、企业 ingestion pipeline、Query Rewrite、Parent-Child、GraphRAG、多向量数据库选型、HNSW/IVF、ES vs Dense、多模态 PDF/Table/Layout、RAG bad-case 排查、retrieval loop stop、多模态语义融合，以及原有 Text-to-SQL 深挖。
+
+### 07 Harness / Eval / Trace
+
+已经覆盖 Harness responsibilities、W3C Trace、Golden Dataset、Hard Guardrail vs Optimization Metric、Multi-Agent failure attribution、Tool Mock / Trajectory Replay、RAG A/B、Agent decision quality metrics、Memory Eval、E2E funnel、Tool accuracy decomposition、线上样本分层、业务因果实验、failure taxonomy、版本发布门禁、Prompt/Context/Harness 分层和 Eval-driven 开发闭环。
+
+## 保留的专项 Deep Dive
+
+`deep-complete.md` 解决全量覆盖；已有专项文档继续承担更细的源码级学习：
 
 ```text
-“RAG 是先检索再生成。”
-“Agent 可以用 ReAct。”
-“MCP 用来统一工具调用。”
-“Redis 可以保存 Session。”
-“Tool 失败可以 retry。”
-“多 Agent 就是 Planner + Worker。”
-“Prompt Injection 用 System Prompt 防。”
+01: Agent Loop / Parallel Tool Calling / Runtime Boundary
+02: Model Routing / ReAct-Plan-DAG / Multi-Agent State Sharing
+03: Tool Schema Runtime / MCP Runtime / Tool Permission
+04: nanobot Recovery / Idempotency-UNKNOWN / Prompt Injection-Sandbox
+05: Context Engineering / Memory-Session-State
+06: Text-to-SQL / Hybrid-RRF-ReRank-OpenViking
+07: Eval-Trace-Replay / Harness Runtime Comparison
 ```
 
-因为这些只描述名词，没有回答：状态归谁、失败如何恢复、权限谁控制、旧结果怎么识别、真实项目到底怎么实现。
+## 完成后的学习方式
 
-## 合格答案示例：Tool Timeout
-
-不应该只说：
+建议优先学习：
 
 ```text
-超时 → retry 3 次
+01 Agent Runtime
+      ↓
+05 Context / Memory / State
+      ↓
+03 Tool / MCP / Policy
+      ↓
+04 Recovery / Security / Idempotency
+      ↓
+02 Planning / Multi-Agent
+      ↓
+06 RAG / Retrieval
+      ↓
+07 Harness / Eval / Trace
 ```
 
-而要继续追到：
+不要背结论。每道题至少要能继续回答：
 
 ```text
-Tool 是 read-only 还是 side-effect？
-        ↓
-请求有没有到达下游？
-        ↓
-本地看到 TIMEOUT，但外部是否可能 SUCCESS？
-        ↓
-如果可能，则进入 UNKNOWN
-        ↓
-有无 business_request_id / idempotency_key？
-        ↓
-query_status / reconcile
-        ↓
-SUCCESS / NOT_FOUND / PROCESSING / UNKNOWN
+状态到底放哪？
+谁拥有写权限？
+模型只有提议权还是执行权？
+崩溃在哪个窗口最危险？
+副作用超时为什么是 UNKNOWN？
+旧异步结果怎么识别？
+为什么不能只靠 Prompt？
+这个项目现在真的实现了吗？
+如果没实现，企业平台在哪层补？
+如何 Trace、Replay、Eval？
 ```
 
-并对照：
+能够沿这些问题继续展开，才算真正掌握。
 
-- Pi 的 effect intent / settlement / replay policy；
-- nanobot 的 interrupted Tool recovery；
-- AgentDock 的任务/容器/平台边界；
-- Java 业务 Service 的 idempotency / authoritative state。
+---
 
-## 执行顺序
-
-接下来继续按下面顺序重构：
-
-```text
-P0：把 01～07 高频主问题全部升级到 Deep Dive
-P1：把 chapter.md 每个问题链接到对应 Deep Dive
-P2：补 Java/Spring 伪代码、状态表、Mermaid 时序图
-P3：加入“源码定位 + 真实项目对比 + 追问树”索引
-```
-
-在 `chapter.md` 的核心题都能指向深度正文之前，仍不标记“01～07 已全部深度完成”。
+**状态结论：01～07 的原始未完成块已经从“部分 Deep Dive”升级为 `104/104 Deep Complete`。后续维护进入“新增题先去重、已有题持续用源码变化校正”的阶段。**
