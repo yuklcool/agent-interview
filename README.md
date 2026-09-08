@@ -14,6 +14,23 @@ chapter.md
 
 后续核心题以 **Deep Dive** 为权威版本；`chapter.md` 只作为题库入口，不再把几段概念性描述当最终答案。
 
+## 先说明 01～07 当前状态
+
+01～07 **不是完全没有深度整理**，但目前还没有做到“全集题目全部深度化”。准确状态是：
+
+```text
+01～07 chapter.md
+= 去重后的全集题库 + 早期答案
+
+01～07 *-deep-dive.md
+= 已经完成源码级深挖的核心题
+```
+
+因此目前不能把“01～07 已迁入仓库”等同于“01～07 已全部深度完成”。详细状态见：
+
+- [01～07 深度重构状态](docs/deep-rewrite-status-01-07.md)
+- [Pi × nanobot × AgentDock × OpenViking 项目案例对照](docs/project-case-map.md)
+
 ## 深度标准
 
 每个重点问题尽量回答到下面 10 层：
@@ -22,14 +39,39 @@ chapter.md
 2. **核心结论**
 3. **底层原理与运行机制**
 4. **实际执行链路 / 状态机 / 数据结构**
-5. **结合 nanobot 当前真实实现与源码文件**
-6. **nanobot 当前没有实现什么**
+5. **真实开源项目当前如何实现**
+6. **项目当前没有实现什么**
 7. **企业级 Java / Spring / Agent 平台怎么补**
 8. **失败场景、边界条件与 Trade-off**
 9. **常见二次/三次追问**
 10. **1～2 分钟面试口述版**
 
-> 原则：不把通用 Agent 最佳实践冒充成 nanobot 已实现能力；模型负责概率性决策，Runtime/Harness 负责约束执行，业务系统负责最终事实和副作用一致性。
+> 原则：不把通用 Agent 最佳实践冒充成某个项目已实现能力；模型负责概率性决策，Runtime/Harness 负责约束执行，业务系统负责最终事实和副作用一致性。
+
+## 真实项目案例基线
+
+后续 01～07 的深度回答优先结合以下四个真实项目，而不是只写抽象理论：
+
+```text
+Pi
+└─ Agent Runtime / Harness / Session / Operation State / Effect Recovery
+
+nanobot
+└─ AgentLoop / Runner / Context Governance / Tool Registry / Recovery / Injection
+
+AgentDock
+└─ Control Plane / Multi-tenant / Container / Driver / Task Event / MCP-Skill 分配
+
+OpenViking
+└─ Context Database / Memory / Resource / Skill / L0-L1-L2 / Retrieval Trajectory
+```
+
+不会机械地每题都写四个项目，而是按题目选最合适的案例。例如：
+
+- Tool Recovery：重点看 **Pi + nanobot**
+- 多租户 / 多实例：重点看 **AgentDock**
+- Context / Memory / Retrieval：重点看 **OpenViking + nanobot + Pi**
+- Harness / Trace：重点看 **Pi + nanobot + AgentDock + OpenViking retrieval trajectory**
 
 ## 当前目录
 
@@ -46,12 +88,16 @@ agent-interview/
 ├── 09-model-training/                   # SFT、LoRA、DPO/GRPO、MoE、KV Cache
 ├── 10-code-agent/                       # Code Agent、AST/LSP、测试生成、Sandbox
 ├── 11-project-productization/           # 项目拷打、Demo→Production、平台化
-└── 12-interview-strategy/               # 公司偏好、学习方法、面试表达
+├── 12-interview-strategy/               # 公司偏好、学习方法、面试表达
+└── docs/                                # 项目对照、重构状态、维护规则
 ```
 
 ## 已经迁入并维护的主章节
 
-目前 01～12 主章节已经全部进入仓库维护。其中 01～07 保留原始全集题库 `chapter.md`，08～12 已按新的更深标准重新整理，不再只做提纲式迁移。
+目前 01～12 主章节已经全部进入仓库维护。其中：
+
+- **01～07：全集题库已经迁入，部分核心题已经做成 Deep Dive，但仍在逐题深度重构。**
+- **08～12：已按新的更深标准重新整理。**
 
 ## 已升级为独立 Deep Dive 的核心题
 
@@ -156,10 +202,11 @@ Context 超限在哪里处理？
 Runtime 如何做硬约束？
 如何 Trace 和 Replay？
 如何证明这个方案真的更好？
+真实项目为什么这样设计？
 ```
 
 这些问题能回答清楚，才算真正掌握。
 
 ---
 
-后续维护规则：新题先语义去重；重复题优先深化现有文章，不新增同义文件；核心题逐步从 `chapter.md` 升级成独立 Deep Dive。下一批优先深化 Multi-Agent State Sharing、Memory/Session、Hybrid Search/ReRank、Spring Agent 集成、Sandbox 和 Tool Permission。
+后续维护规则：新题先语义去重；重复题优先深化现有文章，不新增同义文件；核心题逐步从 `chapter.md` 升级成独立 Deep Dive。01～07 在全部核心题完成深度重构之前，不标记“已全部深度完成”。
