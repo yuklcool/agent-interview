@@ -30,6 +30,7 @@ chapter.md
 
 - [01～07 深度重构状态](docs/deep-rewrite-status-01-07.md)
 - [Pi × nanobot × AgentDock × OpenViking 项目案例对照](docs/project-case-map.md)
+- [Agent 核心 10 题去重索引：Pi × nanobot × AgentDock × OpenViking](docs/core-agent-10-questions-map.md)
 
 ## 深度标准
 
