@@ -7,8 +7,9 @@
 ## 最新补充
 
 - [2026 Agent 面试补充：Agent 架构 vs Chain、ReAct、Long-term Memory](docs/supplement-2026-agent-core-concepts-01.md)
+- [2026 Agent 面试补充：Multi-Agent Systems（协作模式、无限循环、通信冗余）](02-planning-routing-multi-agent/supplement-mas-2026.md)
 
-这组题来自最新截图题库，但不会因为问法不同就重复增加题号；先与现有 01/02/05/06 章节做语义去重，再作为高频追问入口补充深度答案。
+这些补充题来自最新截图题库，但不会因为问法不同就重复增加核心题号；先与现有 01～07 章节做语义去重，再作为高频追问入口补充深度答案。
 
 ## 当前完成状态
 
