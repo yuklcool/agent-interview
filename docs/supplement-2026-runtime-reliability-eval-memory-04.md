@@ -330,230 +330,1390 @@ Java OpenTelemetry
 
 # Q2. 如何搭建 Agent 自动化评测体系？如何量化任务成功率、幻觉率、用户解决率？
 
-## 1. 最大误区：把 Agent Eval 做成“答案相似度”
+## 1. 这题真正考的不是“列几个指标”，而是你有没有把 Agent Eval 做成一套工程系统
 
-Agent 不只是生成文字，还做：
-
-```text
-理解
-→ 规划
-→ 检索
-→ Tool Selection
-→ 参数生成
-→ 外部执行
-→ 状态更新
-→ 最终回答
-```
-
-所以 Eval 至少要评四个层次：
+如果只回答：
 
 ```text
-Outcome      最终业务任务有没有完成
-Trajectory   过程是否合理
-Safety       有没有越权/错误副作用
-Efficiency   花了多少轮、多少 Tool、多少 Token
+准备 Golden Dataset
+→ 跑模型
+→ 用 LLM-as-a-Judge 打分
+→ 看成功率
 ```
 
-## 2. Golden Case 不是 input + expected text
+这还只是一个 Demo 级 Eval。
 
-生产级 case 建议定义：
+生产级 Agent 和普通文本生成最大的区别是：**一次结果背后有完整执行轨迹，而且最终结果可能已经改变真实业务状态。**
+
+一次 Agent Run 可能经历：
+
+```text
+User Request
+    ↓
+Intent / Router
+    ↓
+Context / Memory / RAG
+    ↓
+Model Round #1
+    ↓
+Tool Selection + Arguments
+    ↓
+Tool / MCP / Java Service
+    ↓
+Business State Change
+    ↓
+Model Round #2
+    ↓
+Final Answer
+```
+
+所以我不会只评“最后一句话像不像标准答案”，而是把评测拆成：
+
+```text
+Outcome       最终业务目标有没有完成
+Trajectory    中间决策路径是否正确、稳定、可恢复
+Grounding     结论是否被 Tool / RAG / Business State 支撑
+Safety        有没有越权、错误副作用、跨租户访问
+Efficiency    完成同样任务花了多少轮、Tool、Token、时间和钱
+Resolution    用户问题最终有没有真正解决
+```
+
+这几个维度不能简单平均成一个总分。尤其 `Safety` 和高风险业务结果应该是 **Hard Gate**，不是“平均分扣一点”。
+
+---
+
+## 2. 先定义评测对象：Task、Case、Trial、Trajectory、Outcome、Grader
+
+很多 Eval 做不深，根因是连“到底在评什么”都没有定义清楚。
+
+### Task
+
+用户想完成的业务目标。
+
+例如智慧照明场景：
+
+```text
+分析昨晚高新区异常能耗；
+只有确认存在设备故障时，才允许创建维修工单。
+```
+
+### Eval Case
+
+Task + 初始环境 + 固定数据 + 约束 + 期望结果。
+
+### Trial
+
+同一个 Case 实际跑一次。
+
+因为 Agent 有随机性，一个 Case 不能只跑一次。
+
+### Trajectory
+
+一次 Trial 的完整路径：
+
+```text
+context
+→ model decision
+→ tool call
+→ observation
+→ state transition
+→ model decision
+→ ...
+→ final
+```
+
+### Outcome
+
+最终业务状态，例如：
+
+```text
+是否找到了正确异常设备
+是否错误创建了工单
+最终工单数是多少
+状态是否真的写入业务库
+```
+
+### Grader
+
+判断 Case / Step 是否通过的判定器，可以是：
+
+```text
+确定性代码
+数据库状态校验
+规则校验
+Schema 校验
+检索/引用校验
+LLM Judge
+人工复核
+```
+
+真正成熟的 Eval 系统，数据关系应该类似：
+
+```text
+EvalCase
+   ├─ Trial #1
+   │    ├─ Trajectory
+   │    ├─ Outcome
+   │    └─ GraderResults
+   ├─ Trial #2
+   └─ Trial #3
+```
+
+不是：
+
+```text
+Question → Answer → Score
+```
+
+---
+
+## 3. 整套自动化评测系统应该怎么搭
+
+我会把它设计成一个持续闭环，而不是一个离线脚本：
+
+```text
+                 ┌────────────────────┐
+                 │ Production Traces  │
+                 │ Complaint / Badcase│
+                 └─────────┬──────────┘
+                           ↓
+                  Case Mining / Label
+                           ↓
+                    Eval Case Registry
+             ┌─────────────┼─────────────┐
+             │             │             │
+        Golden Cases   Safety Cases   Long-tail Cases
+             │             │             │
+             └─────────────┼─────────────┘
+                           ↓
+                       Eval Runner
+                           ↓
+             Tool Mock / Simulator / Replay
+                           ↓
+                    Agent Under Test
+                           ↓
+                 Full Trajectory Capture
+                           ↓
+              ┌────────────┼─────────────┐
+              ↓            ↓             ↓
+       Deterministic    Rule Grader    LLM Judge
+          Grader
+              └────────────┼─────────────┘
+                           ↓
+                   Metric Aggregator
+                           ↓
+                     Release Gate
+                           ↓
+                 Shadow / Canary / A-B
+                           ↓
+                  Online Outcome Metrics
+                           ↓
+                  New Failure → Case
+```
+
+这条链里最重要的是最后一环：
+
+> **线上失败必须重新沉淀成 Eval Case。**
+
+否则 Eval 集永远只覆盖“我们曾经想到过的问题”，覆盖不了真实生产里的新失败模式。
+
+---
+
+## 4. Golden Dataset 不是“问题 + 标准答案”
+
+Agent 的 Case 至少应该包含五类东西：
+
+```text
+1. 输入
+2. 初始世界状态
+3. Tool / Data Fixtures
+4. 行为约束
+5. 最终业务后置条件
+```
+
+例如：
 
 ```yaml
-case_id: lighting_alarm_017
-input: "分析昨晚高新区异常能耗，有明确故障才创建工单"
+case_id: lighting_fault_017
+category: fault-diagnosis-and-workorder
+risk: high
+
+input: >
+  分析昨晚高新区异常能耗；只有确认设备故障时才创建工单。
+
 initial_state:
+  tenant_id: t-01
   project_id: p-101
-  existing_work_orders: []
+  open_work_orders: []
+
 fixtures:
-  energy_result: abnormal
-  alarm_result: device_fault
+  query_energy:
+    result: abnormal
+  query_alarm:
+    result:
+      device_id: D-19
+      alarm_type: DRIVER_FAULT
+
 allowed_tools:
   - query_energy
   - query_alarm
   - create_work_order
+
 forbidden_tools:
   - delete_device
-expected_outcome:
-  work_order_count: 1
+  - update_device_owner
+
+required_outcome:
+  fault_device_id: D-19
+  created_work_orders: 1
+
 trajectory_constraints:
-  - query_energy_before_create_work_order
-  - query_alarm_before_create_work_order
-  - create_work_order_at_most_once
+  - query_energy before create_work_order
+  - query_alarm before create_work_order
+  - create_work_order at_most_once
+
 hard_guards:
-  - no_cross_project_access
+  - no_cross_tenant_access
+  - no_workorder_without_fault_evidence
   - no_false_success_claim
-graders:
-  - business_state
-  - tool_sequence
-  - argument_correctness
-  - groundedness
 ```
 
-重点是：
+这里的重点是：
 
-> **最终正确答案不是唯一判定标准。**
+> **expected outcome 不等于 expected wording。**
 
-## 3. Task Success Rate 怎么定义
+Agent 可以用不同语言回答，只要业务结果和行为约束正确，都应该通过。
 
-不要让 LLM 自评。
+---
 
-例如“创建工单”的 success 不是模型说：
+## 5. Case 从哪里来？必须做分层采样，而不是随便攒题
+
+高质量 Eval Set 我通常按来源和风险分层：
 
 ```text
-已创建工单
+真实线上失败            → 最有价值
+用户纠正 / 投诉          → 产品真实痛点
+人工接管                 → Agent 能力边界
+高频 Tool Error          → 可靠性问题
+高风险副作用             → Safety Gate
+历史 Regression Bug      → 防止复发
+长尾 Query               → 泛化能力
+权限 / 租户边界           → Security
+空结果 / Timeout / 429    → Recovery
+正常 Happy Path          → 基线能力
 ```
 
-而是业务系统真实存在：
+同时要给 Case 打标签：
 
 ```text
-work_order_id != null
-AND project_id == expected_project
-AND status in valid_states
+intent
+risk_level
+domain
+tool_family
+requires_rag
+requires_memory
+side_effect
+multi_turn
+long_context
+failure_mode
 ```
 
-因此：
+为什么？因为最后不能只看一个总体 84% 成功率。
+
+例如：
 
 ```text
-Task Success Rate
-= 成功达到业务后置条件的 runs / 总有效 runs
+总体 Task Success = 91%
 ```
 
-对于纯问答类任务，可以用：
+看起来很好，但拆开：
 
 ```text
-Reference-based grader
-Evidence-based grader
-Human label
-LLM-as-judge（只能作为一个 grader，不能是唯一事实源）
+普通查询      97%
+RAG 问答      94%
+工单创建      89%
+跨租户安全    99.5%
+退款类副作用   82%
 ```
 
-## 4. 幻觉率不要只定义一个指标
+那这个版本显然不能因为“总体 91%”就上线。
 
-建议拆成：
+---
+
+# 6. 任务成功率 Task Success Rate 到底怎么定义？
+
+这是这道题最核心的地方之一。
+
+## 6.1 不要让模型自己说“我完成了”
+
+例如用户要求：
 
 ```text
-Unsupported Claim Rate
-  没有证据支持的事实性声明比例
-
-Wrong-State Claim Rate
-  与业务真实状态冲突的声明比例
-
-Citation Mismatch Rate
-  引用存在，但引用内容不支持结论
-
-Fabricated Tool Result Rate
-  模型声称 Tool 返回了不存在的数据
+创建一张 D-19 的故障工单
 ```
 
-特别重要：
+模型最后说：
+
+```text
+工单已创建成功。
+```
+
+不代表成功。
+
+真正的 Source of Truth 应该来自业务系统：
+
+```text
+work_order exists
+AND work_order.device_id == D-19
+AND work_order.project_id == p-101
+AND work_order.status in valid_states
+AND duplicate_count == 0
+```
+
+所以一个高风险 Action Task 可以直接定义：
+
+```text
+TaskSuccess =
+    required_business_postconditions_pass
+AND all_hard_guards_pass
+```
+
+也就是：
+
+```text
+Success ∈ {0, 1}
+```
+
+不是让 LLM Judge 给一个 0.83。
+
+## 6.2 多目标任务怎么办？
+
+例如：
+
+```text
+分析异常
++ 给出原因
++ 创建工单
++ 汇报工单编号
+```
+
+应该拆：
+
+```text
+Hard Requirements
+├─ 正确定位设备
+├─ 有故障证据才能创建
+├─ 工单真正存在
+└─ 不越权
+
+Soft Requirements
+├─ 解释清晰度
+├─ 排版
+└─ 建议质量
+```
+
+最终可以：
+
+```text
+Hard Task Success = all hard requirements pass
+```
+
+另外单独记录：
+
+```text
+Partial Completion Score
+Explanation Quality
+```
+
+不要把“解释写得很好”拿去抵消“错误创建了一张工单”。
+
+## 6.3 Agent 是随机系统，要看 Trial Pass Rate
+
+一个 Case 只跑一次会非常不稳定。
+
+例如同一个 Case 跑 20 次：
+
+```text
+16 次成功
+4 次失败
+```
+
+应该记录：
+
+```text
+case_pass_rate = 16 / 20 = 80%
+```
+
+而不是说：
+
+```text
+这个 Case 通过了
+```
+
+对于高风险 Case，我更关心：
+
+```text
+Worst-case failure
+Failure clustering
+多次运行稳定性
+```
+
+生产发布门禁应该按 Case Slice 看，而不是只看总平均。
+
+---
+
+# 7. 幻觉率怎么量化？先把“幻觉”拆开
+
+“幻觉率”如果只定义成：
+
+```text
+错误回答数 / 总回答数
+```
+
+基本没有诊断价值。
+
+Agent 里的幻觉至少分四类：
+
+```text
+Unsupported Claim
+  说了一个事实，但当前证据里没有支持
+
+Wrong-State Claim
+  与真实业务状态冲突
+
+Fabricated Tool Result
+  声称 Tool 返回了根本不存在的数据
+
+Citation / Evidence Mismatch
+  有引用，但引用内容并不能支持这个结论
+```
+
+例如：
 
 ```text
 ToolResult.status = UNKNOWN
 ```
 
-最终说成：
+模型最后说：
 
 ```text
-退款成功
+退款已经成功。
 ```
 
-这是业务幻觉，严重程度远高于普通知识问答的小事实错误。
+这是非常严重的 `Wrong-State Claim`，危险程度远高于一般知识问答里的小事实错误。
 
-## 5. 用户解决率怎么量化
+---
 
-“用户满意”非常模糊，建议建立 proxy：
+## 7.1 幻觉评测应该以“Claim”为单位，而不是整段回答为单位
+
+推荐流程：
 
 ```text
-Resolved without human takeover
-No reopen within N hours
-No immediate correction
-No same-intent repeated query
-No escalation/complaint
+Final Answer
+    ↓
+Claim Extraction
+    ↓
+只保留可验证事实 Claim
+    ↓
+给每个 Claim 找 Evidence
+    ↓
+Entailment / Contradiction / Unsupported
+    ↓
+聚合
 ```
+
+例如最终回答：
+
+```text
+昨晚有 12 台设备异常，主要集中在高新区；
+其中 D-19 为驱动故障，我已经创建工单 WO-1028。
+```
+
+可以拆成：
+
+```text
+C1: 昨晚有 12 台设备异常
+C2: 异常主要集中在高新区
+C3: D-19 是驱动故障
+C4: 已创建工单 WO-1028
+```
+
+然后分别对照：
+
+```text
+RAG Evidence
+ToolResult
+Business DB
+Audit Event
+```
+
+判断每个 Claim。
+
+## 7.2 基础公式
+
+可以定义：
+
+```text
+Unsupported Claim Rate
+= unsupported factual claims / all factual claims
+```
+
+以及：
+
+```text
+Wrong-State Claim Rate
+= claims contradicting authoritative business state
+  / business-state claims
+```
+
+但生产里最好做 Severity Weight：
+
+```text
+一般描述错误           weight = 1
+错误设备状态           weight = 3
+错误声称工单创建成功    weight = 5
+错误声称退款成功        weight = 10
+跨租户敏感信息          Hard Fail
+```
+
+于是可以得到：
+
+```text
+Weighted Hallucination Risk
+= Σ hallucinated_claim_i × severity_i
+  / Σ factual_claim_i × severity_i
+```
+
+但对于安全类错误仍然不要靠加权平均“稀释”，应该直接 Hard Fail。
+
+---
+
+## 7.3 谁来判断 Evidence 是否支持 Claim？
+
+优先级应该是：
+
+```text
+业务数据库 / API 后置状态
+        ↓
+结构化 ToolResult
+        ↓
+确定性 Rule / SQL / JSON 校验
+        ↓
+引用文本 Entailment
+        ↓
+LLM Judge
+        ↓
+人工复核
+```
+
+能用代码判断的，不要交给 LLM。
 
 例如：
+
+```text
+work_order_id 是否存在
+```
+
+直接查 DB。
+
+不要问另一个模型：
+
+```text
+“你觉得 Agent 有没有真的创建工单？”
+```
+
+---
+
+# 8. 用户解决率 Resolution Rate 怎么定义？它和 Task Success 不是同一个东西
+
+这是很多面试回答里最容易混淆的地方。
+
+`Task Success` 更偏技术评测：
+
+```text
+这一轮 Agent 是否达到了定义好的目标？
+```
+
+`User Resolution` 更偏线上产品结果：
+
+```text
+用户的问题最后是不是真的被解决了？
+```
+
+例如 Agent 第一次回答不完整，但用户补了一句话后第二轮完成了任务：
+
+```text
+单 Trial 可能失败
+但 Session 最终可能 Resolved
+```
+
+因此 Resolution 应该在 **Session / Case Window** 层计算，而不是单 Response。
+
+---
+
+## 8.1 推荐定义一个“已解决”的可观测条件
+
+例如客服/运维类 Agent：
+
+```text
+verified_business_outcome = true
+AND no_human_takeover
+AND no_user_correction_within_window
+AND no_reopen_within_N_hours
+AND no_same_intent_repeat_within_window
+```
+
+可以定义：
 
 ```text
 Resolution Rate
-= 完成且 N 小时内未重开 / 有效会话数
+= verified_resolved_sessions / eligible_sessions
 ```
 
-配合：
+同时拆辅助指标：
 
 ```text
-human_takeover_rate
-reopen_rate
-repeat_intent_rate
-user_correction_rate
-abandon_rate
+Human Takeover Rate
+Reopen Rate
+Same-intent Repeat Rate
+User Correction Rate
+Abandon Rate
+Escalation Rate
+Time To Resolution
+Turns To Resolution
 ```
 
-## 6. Offline Eval + Online Eval 必须分开
+这里一定要注意：
 
-### Offline
+```text
+用户不再说话 ≠ 问题已解决
+```
+
+可能是：
+
+```text
+用户放弃
+页面关闭
+回答太差懒得继续
+```
+
+所以“没有后续消息”不能直接作为解决成功。
+
+---
+
+# 9. Trajectory Eval：为什么最终做对了，过程仍然可能判差？
+
+假设两个 Agent 最后都创建了正确工单。
+
+Agent A：
+
+```text
+query_energy
+→ query_alarm
+→ create_work_order
+→ final
+```
+
+Agent B：
+
+```text
+query_energy
+→ web_search
+→ query_energy
+→ query_device
+→ query_alarm
+→ create_work_order
+→ create_work_order again
+→ final
+```
+
+如果只看最终文本或工单存在，两者可能都算成功。
+
+但 B 明显存在：
+
+```text
+重复调用
+无关 Tool
+更高延迟
+更高 Token/Tool Cost
+潜在重复副作用
+```
+
+所以 Trajectory 至少评：
+
+```text
+Router Accuracy
+Tool Selection Accuracy
+Argument Validity
+Argument Semantic Correctness
+Required Tool Coverage
+Forbidden Tool Rate
+Call Necessity
+Call Ordering
+Repeated Tool Rate
+No-progress Rate
+Retry Count
+Recovery Quality
+State Transition Correctness
+```
+
+甚至可以定义：
+
+```text
+Tool Efficiency
+= minimum_reasonable_tool_calls / actual_tool_calls
+```
+
+但“最优路径”要谨慎，因为一个复杂任务可能存在多条都合理的路径，所以更适合定义：
+
+```text
+允许路径集合
+必要前置条件
+禁止行为
+最大预算
+```
+
+而不是只允许唯一 Tool Sequence。
+
+---
+
+# 10. Grader 体系：LLM-as-a-Judge 只能是其中一层
+
+我会按可靠性分四层：
+
+```text
+L0 Deterministic Grader
+   DB/SQL state
+   exact JSON field
+   unit test
+   schema
+   permission
+
+L1 Rule / Policy Grader
+   forbidden tool
+   ordering constraint
+   budget
+   side-effect count
+
+L2 Evidence / Semantic Grader
+   citation entailment
+   answer groundedness
+   semantic completeness
+
+L3 Human Review
+   高风险抽检
+   Judge 校准
+   模糊边界样本
+```
+
+LLM Judge 最适合判断：
+
+```text
+解释是否完整
+是否回答了用户问题
+语义相关性
+总结质量
+```
+
+但不应该独立决定：
+
+```text
+退款是否真的成功
+是否越权
+是否重复扣款
+是否跨租户
+```
+
+这些必须由确定性系统判断。
+
+另外 Judge 本身也要版本化：
+
+```text
+judge_model
+judge_prompt_version
+judge_schema_version
+```
+
+否则两个月后评测分数变化，你甚至不知道是被测 Agent 变了，还是 Judge 变了。
+
+---
+
+# 11. Tool Mock / Simulator：离线 Eval 为什么必须冻结“外部世界”
+
+如果 Eval 每次真的调用：
+
+```text
+实时天气
+航班 API
+生产数据库
+支付系统
+邮件
+Web Search
+```
+
+你很难公平比较两个模型，因为外部世界在变。
+
+所以离线评测应该把 Tool 变成：
+
+```text
+(tool_name, normalized_args, scenario_state)
+                ↓
+         Fixture / Simulator
+                ↓
+       deterministic ToolResult
+```
+
+例如：
+
+```yaml
+query_alarm:
+  match:
+    project_id: p-101
+    date: 2026-09-14
+  result:
+    status: SUCCESS
+    alarms:
+      - device_id: D-19
+        type: DRIVER_FAULT
+```
+
+同时不能只 Mock Happy Path，还要专门模拟：
+
+```text
+Timeout
+429
+5xx
+NO_RESULT
+Permission Denied
+Malformed Result
+Partial Result
+Stale Data
+UNKNOWN Side-effect
+```
+
+因为 Agent 的可靠性差距往往不是出现在 Happy Path，而是在失败后的 Recovery。
+
+---
+
+# 12. Replay 应该分三种，不要只会说“重放历史对话”
+
+### 12.1 Full Case Re-run
+
+完整重跑 Agent + Mock Tools。
+
+适合：
+
+```text
+模型 / Prompt / Router / Tool Schema 全链路回归
+```
+
+### 12.2 Trajectory Replay
+
+冻结历史 Observation：
+
+```text
+User
+Tool Result A
+Tool Result B
+```
+
+只重新跑模型决策。
+
+适合快速比较：
+
+```text
+Prompt A vs B
+Model A vs B
+```
+
+但它有局限：新模型如果走了历史轨迹不存在的 Tool 分支，就没有对应 Observation。
+
+### 12.3 Component Replay
+
+只冻结某一层：
+
+```text
+固定 Retrieval Result → 测 Generator
+固定 Model Tool Call  → 测 Harness / Adapter
+固定 Tool Result       → 测 Final Synthesis
+```
+
+这个能力对故障归因特别有用。
+
+---
+
+# 13. Eval 数据怎么落库，才能支持真正分析
+
+最少可以有：
+
+```text
+eval_case
+├─ case_id
+├─ category
+├─ risk_level
+├─ dataset_version
+├─ input
+├─ initial_state
+└─ expected_contract
+
+eval_trial
+├─ trial_id
+├─ case_id
+├─ release_fingerprint
+├─ started_at
+├─ stop_reason
+├─ latency_ms
+├─ token_cost
+└─ task_success
+
+eval_step
+├─ trial_id
+├─ iteration
+├─ step_type
+├─ tool_name
+├─ args_hash
+├─ result_status
+├─ latency_ms
+└─ error_kind
+
+grader_result
+├─ trial_id
+├─ grader_name
+├─ grader_version
+├─ metric
+├─ score
+├─ passed
+└─ evidence
+```
+
+然后才能做：
+
+```text
+按模型版本比较
+按 Tool 比较
+按风险等级比较
+按错误类型比较
+按 Tenant/Domain Slice 比较
+```
+
+如果所有东西最后只落一个：
+
+```text
+score = 0.86
+```
+
+几乎没有排障价值。
+
+---
+
+# 14. 指标聚合不能只看平均值，要看 Slice、长尾和 Hard Gate
+
+假设新版本：
+
+```text
+Overall Task Success
+82% → 86%
+```
+
+但同时：
+
+```text
+P95 Tool Calls         +35%
+High-risk Success      99% → 94%
+Wrong-State Claims     0.2% → 1.8%
+Cross-tenant Violation 0 → 1 case
+```
+
+这个版本不能上线。
+
+所以 Release Gate 可以定义：
+
+```text
+Hard Gate
+├─ cross_tenant_violation == 0
+├─ unapproved_side_effect == 0
+├─ duplicate_high_risk_action == 0
+└─ false_success_on_UNKNOWN == 0
+
+Quality Gate
+├─ task_success >= baseline - tolerance
+├─ hallucination_risk <= threshold
+├─ resolution_rate >= baseline
+└─ high-risk slice >= target
+
+Efficiency Gate
+├─ p95_latency <= budget
+├─ tool_calls_per_success <= budget
+└─ cost_per_success <= budget
+```
+
+高风险 Case 不应该用平均分抵消。
+
+---
+
+# 15. 自动化评测不能忽略统计稳定性
+
+Agent 有随机性，所以：
+
+```text
+一个 Case 跑 1 次
+```
+
+信息量很低。
+
+至少对关键 Case 做多次 Trial：
+
+```text
+Case A: 20 trials
+16 pass / 4 fail
+pass_rate = 80%
+```
+
+版本比较时不要只看：
+
+```text
+86% > 84%
+```
+
+还要看：
+
+```text
+样本量
+置信区间
+失败是否集中在某个 Slice
+是否是高风险 Case
+成本/延迟是否显著恶化
+```
+
+对于安全红线，更简单：
+
+```text
+出现 1 次即 fail
+```
+
+而不是做统计显著性辩论。
+
+---
+
+# 16. Offline Eval 和 Online Eval 分工完全不同
+
+## Offline Eval
+
+主要回答：
+
+```text
+这个版本是否应该进入生产？
+```
+
+典型：
 
 ```text
 Golden Set
+Safety Set
 Tool Mock
-Trajectory Replay
-Failure Fixtures
+Simulator
+Replay
+Regression
 Adversarial Cases
-Multiple Trials
+Repeated Trials
 ```
 
-### Online
+## Online Eval
+
+主要回答：
 
 ```text
-Shadow
-Canary
-Real Business Outcome
+真实用户、真实流量下有没有出现离线集没覆盖的问题？
+```
+
+看：
+
+```text
+Business Outcome
 Human Takeover
+Reopen
 User Correction
 Complaint
-Cost/Latency
+Same-intent Repeat
+Abandon
+Latency
+Cost
+Provider Failure
 ```
 
-同一个 case 建议多次运行：
+完整闭环：
 
 ```text
-pass_rate = passed_trials / total_trials
+Offline Gate
+    ↓
+Shadow
+    ↓
+Sticky Canary
+    ↓
+Online Metrics
+    ↓
+Trace Sampling
+    ↓
+Badcase Mining
+    ↓
+Golden Set 增量
 ```
 
-因为 Agent 是随机系统，一次成功不能说明稳定。
+---
 
-## 7. 真正应该建立 Error Taxonomy
+# 17. 如何快速定位失败到底在哪一层
+
+每个 Trial 最终都应该落一个 Failure Taxonomy：
+
+```text
+ROUTER_ERROR
+CONTEXT_ASSEMBLY_ERROR
+RETRIEVAL_ERROR
+MEMORY_ERROR
+PLAN_ERROR
+TOOL_SELECTION_ERROR
+ARGUMENT_ERROR
+POLICY_ERROR
+TOOL_PROVIDER_ERROR
+ADAPTER_MAPPING_ERROR
+STATE_TRANSITION_ERROR
+RECOVERY_ERROR
+FINAL_SYNTHESIS_ERROR
+```
 
 例如：
 
 ```text
-ROUTER_ERROR
-RETRIEVAL_ERROR
-PLAN_ERROR
-TOOL_SELECTION_ERROR
-ARGUMENT_ERROR
-TOOL_PROVIDER_ERROR
-STATE_MERGE_ERROR
-POLICY_ERROR
-FINAL_SYNTHESIS_ERROR
+用户：查 A 项目异常灯具
 ```
 
-这样每周才能回答：
+如果：
 
 ```text
-Task Success -3%
-到底是：
-模型退化？
-RAG 退化？
-Tool 503？
-还是 Adapter bug？
+模型选 query_energy，应该选 query_alarm
 ```
 
-## 8. 项目对照
+→ `TOOL_SELECTION_ERROR`
 
-- nanobot：Hook/iteration/tool boundary 非常适合记录 trajectory。
-- AgentDock：Task、Event Stream、token、iteration、success rate 可作为平台级 Eval 数据源。
-- OpenViking：有 retrieval path / session-memory 机制，适合做 Memory/Retrieval 归因，而不是只看最终答案。
-- Pi 类 Harness：适合把 operation/effect state 纳入 outcome grader，例如操作是否真正 settle，而不是只看模型文本。
+如果：
+
+```text
+Tool 对，但 project_id=B
+```
+
+→ `ARGUMENT_ERROR / CONTEXT_ERROR`
+
+如果：
+
+```text
+参数正确，Java API 500
+```
+
+→ `TOOL_PROVIDER_ERROR`
+
+如果：
+
+```text
+ToolResult=NO_RESULT，最终回答却说找到 10 台
+```
+
+→ `FINAL_SYNTHESIS_ERROR`
+
+这才是 Eval 真正能指导工程迭代的地方。
+
+---
+
+# 18. 结合 nanobot、AgentDock、OpenViking 怎么落地
+
+可以按职责拆开，而不是强行让一个组件承担全部 Eval：
+
+```text
+AgentDock / Control Plane
+├─ task/run 级指标
+├─ release fingerprint
+├─ tenant / agent / driver slice
+├─ canary assignment
+├─ usage / cost
+└─ Eval Job 调度
+
+nanobot Runtime
+├─ iteration
+├─ model round
+├─ tool proposal
+├─ tool result
+├─ stop_reason
+├─ usage
+└─ Hook / Event 轨迹采集
+
+OpenViking / Context Plane
+├─ retrieval result ids
+├─ memory/resource provenance
+├─ context source
+└─ retrieval quality attribution
+
+Java Domain Service
+├─ authoritative business outcome
+├─ authorization result
+├─ idempotency result
+├─ transaction state
+└─ audit / side-effect truth
+```
+
+这里最重要的原则是：
+
+> **模型层负责“生成候选行为”，Eval 的最终业务真相必须回到业务系统和 Runtime Trace。**
+
+例如工单是否成功，最终应该由 Java/Postgres 的真实状态判定，不是由 nanobot 最后一段文本判定。
+
+---
+
+# 19. 如果让我在 Java / AgentDock 中真正实现，我会这样拆服务
+
+```text
+EvalCaseRegistry
+    ↓
+EvalRunScheduler
+    ↓
+AgentDriver / AgentDock Task
+    ↓
+MockToolGateway / Simulator
+    ↓
+TraceCollector
+    ↓
+GraderPipeline
+    ├─ BusinessStateGrader
+    ├─ TrajectoryGrader
+    ├─ PolicyGrader
+    ├─ GroundingGrader
+    └─ LLMJudgeGrader
+    ↓
+MetricAggregator
+    ↓
+ReleaseGateService
+```
+
+Java 可以抽象：
+
+```java
+public interface Grader {
+    GraderResult grade(EvalCase evalCase, EvalTrial trial);
+}
+```
+
+高风险业务尽可能写成确定性 Grader：
+
+```java
+BusinessStateGrader
+PolicyGrader
+SideEffectCountGrader
+TenantBoundaryGrader
+```
+
+只有语义质量才交给 LLM Judge。
+
+---
+
+# 20. 一个完整例子：怎么算这三个核心指标
+
+假设一天跑 1000 个有效 Session。
+
+其中：
+
+```text
+850 个最终达到业务目标
+20 个虽然模型说成功，但 DB 状态实际上没成功
+30 个需要人工接管后才完成
+50 个用户 2 小时内再次重复同一问题
+50 个直接放弃，无法确认解决
+```
+
+### Task Success
+
+如果 1000 个 Eval Trial 里，850 个业务后置条件真实通过：
+
+```text
+Task Success Rate = 850 / 1000 = 85%
+```
+
+### Hallucination
+
+假设抽取到 4000 个可验证事实 Claim：
+
+```text
+80 unsupported
+20 wrong business state
+```
+
+基础：
+
+```text
+Claim Hallucination Rate = 100 / 4000 = 2.5%
+```
+
+但 20 个 Wrong-State 应单独看，因为风险明显更高。
+
+### User Resolution
+
+如果定义：
+
+```text
+业务目标完成
++ 无人工接管
++ 2 小时内无重复同意图
++ 无立即纠正
+```
+
+最终只有 780 个 Session 满足：
+
+```text
+Resolution Rate = 780 / eligible_sessions
+```
+
+这里 `eligible_sessions` 要排除无法判断结果的测试流量、系统中断等非产品原因；不能机械拿所有会话做分母。
+
+这个例子也说明：
+
+```text
+Task Success ≠ Resolution Rate ≠ Hallucination Rate
+```
+
+三个指标衡量的是不同层面。
+
+---
+
+# 21. 最容易踩的几个坑
+
+```text
+只看 Final Answer
+→ 看不到错误轨迹和副作用
+
+只用 LLM Judge
+→ 无法可靠判断业务真相和权限
+
+Case 只跑一次
+→ 看不到随机系统稳定性
+
+只有 Happy Path
+→ 看不到 Recovery 能力
+
+只看总体平均
+→ 高风险 Slice 被稀释
+
+用户不回复就算解决
+→ 把放弃误判成成功
+
+Tool 每次打真实生产系统
+→ Eval 不可重复且有副作用风险
+
+不版本化 Judge / Dataset / Tool Fixture
+→ 分数无法复现
+```
+
+---
+
+# 22. 1～2 分钟面试口述版
+
+> 我会把 Agent Eval 当成一套持续工程系统，而不是“准备一批问题，然后让另一个 LLM 打分”。首先定义 Task、Case、Trial、Trajectory、Outcome 和 Grader。每个 Case 不只是问题和标准答案，还要冻结初始业务状态、Tool Fixture、允许/禁止动作、必要前置条件和最终业务后置条件。评测维度至少分 Outcome、Trajectory、Grounding、Safety、Efficiency 和 Resolution。任务成功率要以真实业务后置条件为准，比如工单是否真的写入数据库，而不是模型说“已创建”；幻觉率应该先把最终答案拆成可验证 Claim，再分别判断 Unsupported、Wrong-State、Fabricated Tool Result 和 Citation Mismatch，高风险错误单独做 Hard Fail；用户解决率则是 Session 级线上指标，要结合真实业务结果、是否人工接管、是否重开、是否重复同意图、是否被用户纠正，不能把“用户没再说话”直接当成解决。离线侧用 Golden Set、Safety Set、Tool Mock、Simulator 和 Replay 做可重复回归，同一 Case 多次 Trial 看稳定性；线上走 Shadow、Sticky Canary，并把生产 Trace、投诉和人工接管继续沉淀回 Eval Set。nanobot 负责采集 iteration/tool trajectory，AgentDock 负责 task/release/canary 和平台指标，Java 业务服务提供最终 Source of Truth。这样 Eval 才能真正回答三个问题：这个 Agent 有没有完成任务、有没有安全可靠地完成、以及真实用户的问题有没有最终解决。
 
 ---
 
