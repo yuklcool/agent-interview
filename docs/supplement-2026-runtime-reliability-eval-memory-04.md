@@ -1,278 +1,567 @@
-# 2026 Agent 面试补充：性能瓶颈、Eval、Tool 容错、Memory 隔离与 Token 兜底
+# 2026 Agent 生产级面试专题：性能、可靠性、Eval、Session、Memory 与 Token 治理
 
-> 本组来自最新截图题库，共 12 道高频生产级追问。与现有 01/04/05/07/08 章节做语义去重后，作为“跨章节高阶追问专题”保留。重点不是背术语，而是把性能、可靠性、评测、会话、记忆和成本治理串成一套可落地的 Agent Runtime 设计。
-
-## 对应主章节
-
-| 截图问题 | 主要映射 |
-|---|---|
-| Agent 链路性能瓶颈怎么找 | 07 Harness / Trace + 08 Java Engineering |
-| 自动化评测体系 | 07 Eval / Replay |
-| 模型/Prompt 迭代怎么做基线和灰度 | 07 Eval + Release Governance |
-| Tool 超时/抖动/空数据/重试/降级 | 04 Reliability |
-| 怎么区分模型问题和下游接口问题 | 07 Trace / Failure Attribution |
-| 无效 Tool 调用怎么限流、拦截 | 03 Tool Runtime + 04 Reliability |
-| Redis 在 Agent 中存什么 | 08 Java Engineering + 05 Session |
-| 多用户高并发会话/记忆隔离 | 05 Context/Memory + AgentDock Control Plane |
-| 短期滑窗与长期用户画像 | 05 Context / Memory |
-| Memory 膨胀后怎么治理 | 05 Memory + OpenViking |
-| Token 溢出多级兜底 | 05 Context Governance |
-| Tool 死循环怎么检测终止 | 04 Reliability + 07 Harness |
+> 本文不是“12 道题的简答题答案”，而是把这组题当成一套 **生产级 Agent Runtime 设计题** 来回答。
+>
+> 讨论重点：性能归因、自动化评测、灰度发布、Tool 容错、故障归因、限流与熔断、Redis/Session、多租户隔离、长期记忆、Memory 膨胀、Token 溢出、死循环检测。
+>
+> 实际项目对照优先使用：**nanobot、AgentDock、OpenViking、Pi 类 Agent Harness**。对于当前项目源码里没有直接实现的能力，会明确写成“企业级补强”，不会把设计建议写成项目现状。
 
 ---
 
-# Q1. Agent 整套链路性能瓶颈大概率出现在哪一环？检索、推理还是 Tool？怎么排查优化？
+# 0. 先用一张图理解这 12 道题到底在考什么
 
-## 面试官真正考什么
+这 12 道题表面分散，其实都在问同一个问题：
 
-不是问“哪个最慢”，而是看你是否会做 **分段性能归因**。Agent 不是一个普通 HTTP 接口，而是一条多阶段、可能循环的链路：
+> **如何把一个概率性的 LLM Tool Loop，变成一个可观测、可限流、可恢复、可评测、可多租户运行的生产系统？**
 
-```text
-Ingress / Session
-      ↓
-Context Build
-      ↓
-Retrieval / Memory
-      ↓
-LLM Round #1
-      ↓
-Tool Call
-      ↓
-Downstream API / DB / MCP
-      ↓
-LLM Round #2
-      ↓
-Final Synthesis
-      ↓
-Persist / Stream
-```
-
-真正的瓶颈取决于任务形态：RAG 重的系统可能卡检索；复杂规划任务可能卡模型；大量业务 Tool 的系统通常卡外部 API、DB、连接池和重试。
-
-## 核心方法：不要猜，做分段 Trace
-
-一条 Run 至少拆成这些 Span：
+可以把整个系统拆成五层：
 
 ```text
-run
-├─ context.build
-├─ retrieval
-│  ├─ bm25
-│  ├─ dense
-│  └─ rerank
-├─ llm.round.1
-├─ tool.query_device
-│  └─ java-service
-│     └─ jdbc
-├─ llm.round.2
-└─ persist
+                         AgentDock
+                 ┌────────────────────┐
+                 │ Control Plane      │
+                 │ tenant / user      │
+                 │ agent / container  │
+                 │ task / event       │
+                 │ quota / lifecycle  │
+                 └─────────┬──────────┘
+                           │
+                           ▼
+                    Agent Runtime
+         ┌────────────────────────────────┐
+         │ nanobot / Pi-like Harness      │
+         │ Session → Context → LLM        │
+         │        → Tool → Observation    │
+         │        → Next Iteration        │
+         └───────────┬─────────────┬──────┘
+                     │             │
+             Context Plane      Tool Plane
+                     │             │
+                     ▼             ▼
+              OpenViking      MCP / Java API
+           Memory/Resource     DB / HTTP / MQ
+                     │             │
+                     └──────┬──────┘
+                            ▼
+                     Business Truth
 ```
 
-每段至少看：
+生产问题几乎都出现在这些“边界”上：
 
 ```text
-P50 / P95 / P99
-queue_wait
-active concurrency
-retry count
-token input/output
-tool payload size
-DB acquire latency
-HTTP connection wait
-provider 429/5xx
+Context 太大                → Token / latency / attention dilution
+LLM 决策错误                → wrong tool / wrong args / hallucination
+Tool 不稳定                 → timeout / retry storm / UNKNOWN
+多用户共享                  → session / memory / permission leakage
+版本迭代                    → regression / canary / rollback
+Loop 不能收敛               → repeated tool / no-progress / cost explosion
+没有完整 Trace              → 最终只知道“答错了”，不知道哪里错
 ```
 
-### 一个很常见的误判
+所以真正的主线不是“Prompt 怎么写”，而是：
 
-表面上：
-
-```text
-一次请求 12s
-```
-
-你看到 LLM 单次 3s，以为模型最慢。
-
-实际 Trace：
-
-```text
-LLM #1       3.0s
-Tool API     1.5s
-Tool retry   1.5s
-Tool retry   1.5s
-LLM #2       2.8s
-Context      0.8s
-Queue Wait   0.9s
-```
-
-这时优化模型只省 500ms，真正问题是 Tool retry 和多轮 Loop。
-
-## 优化顺序
-
-先判断是哪一类瓶颈：
-
-```text
-Retrieval 慢
-→ metadata filter / ANN 参数 / rerank topK / cache / index
-
-LLM 慢
-→ 减少 round 数 / context token / model routing / stream / cache
-
-Tool 慢
-→ timeout / connection pool / bulkhead / parallel-safe calls / cache / async
-
-Loop 慢
-→ 减少重复 Tool / no-progress detection / planner quality / stop condition
-```
-
-## AgentDock / nanobot 怎么讲
-
-AgentDock 可以在 Task/Event/Driver 层记录端到端耗时、token、agent/container 状态；nanobot 的 `AgentHook` 则更适合插入 iteration、Tool 前后和 Run 结束的细粒度 instrumentation。企业里最好把两层 Trace 打通：
-
-```text
-AgentDock task span
-      ↓
-nanobot run span
-      ↓
-llm/tool spans
-      ↓
-Java service / DB span
-```
-
-## 1～2 分钟口述版
-
-> 我不会先猜是检索、模型还是 Tool 慢，而会把一次 Agent Run 拆成 Context、Retrieval、每轮 LLM、每次 Tool、下游 HTTP/SQL 和最终持久化几个 Span，分别看 P95/P99、queue wait、retry、token、连接池等待。Agent 最容易出现“单段不慢但循环很多”的问题，所以还要看 LLM round 数和重复 Tool 次数。像 AgentDock 负责平台级 Task/Container 观测，nanobot 可以通过 AgentHook 抓 iteration 和 Tool 边界，再把 traceparent 传给 Java 服务和 DB，就能快速判断瓶颈到底在哪一层。
+> **Runtime/Harness 用确定性的工程约束，把模型的不确定性限制在可接受范围内。**
 
 ---
 
-# Q2. 如何搭建 Agent 自动化评测体系？怎么量化任务成功率、幻觉率、用户解决率？
+# Q1. Agent 整套链路性能瓶颈大概率出现在哪一环？检索、推理还是 Tool？怎么排查和优化？
 
-## 不要只做“问答准确率”
+## 1. 面试官真正考什么
 
-Agent 需要评估两层：
+这题不是让你猜“LLM 最慢”。它在考：
+
+1. 你是否知道 Agent 是 **多轮循环系统**，不是一次模型请求；
+2. 你能否做 **端到端性能分解**；
+3. 你是否能区分：单次耗时、排队时间、重复执行、长尾 P99；
+4. 你能否证明优化到底优化了哪一层。
+
+真正生产里很常见的情况是：
+
+> 单个组件都不算特别慢，但 Agent 多跑了两轮 LLM、多调了三次 Tool，最终整体从 4 秒变成 15 秒。
+
+## 2. 先建立 Agent Latency Model
+
+一轮 Agent Run 总耗时可以粗略写成：
 
 ```text
-Outcome：最终任务有没有完成
-Trajectory：完成过程是否正确、安全、高效
+T_total
+≈ T_ingress
++ Σ T_context(i)
++ Σ T_retrieval(i)
++ Σ T_llm(i)
++ Σ T_tool(i)
++ T_queue
++ T_retry
++ T_persist
 ```
 
-只看最终答案会漏掉很多问题。例如 Agent 最终给出了正确答案，但中间乱调了 10 次 Tool，线上成本和风险已经不可接受。
-
-## Golden Case 结构
-
-一个案例不应该只是：
+注意不是：
 
 ```text
-input → expected text
+T_total = T_llm
 ```
 
-而应该包含：
+例如：
+
+```text
+Run = 13.4s
+
+context build             0.6s
+retrieval + rerank        0.9s
+LLM round #1              2.8s
+tool A queue wait         0.7s
+tool A HTTP               1.1s
+tool A retry              1.3s
+LLM round #2              2.6s
+tool B                    1.0s
+LLM round #3              2.1s
+persist/stream            0.3s
+```
+
+看到这里，真正问题可能不是模型推理，而是：
+
+```text
+Tool retry
++
+不必要的第 3 轮 LLM
++
+queue wait
+```
+
+## 3. 必须做 Span 级 Trace，而不是只记录 request_duration
+
+推荐 Trace：
+
+```text
+agent.run
+├── session.resolve
+├── context.build [iteration=1]
+├── retrieval
+│   ├── bm25
+│   ├── dense
+│   ├── fusion
+│   └── rerank
+├── llm.request [iteration=1]
+├── tool.execute [tool=query_energy]
+│   ├── queue.wait
+│   ├── http.client
+│   └── postgres.query
+├── context.build [iteration=2]
+├── llm.request [iteration=2]
+└── persist.final
+```
+
+至少记录：
+
+```text
+trace_id
+run_id
+turn_id
+iteration
+tool_call_id
+tool_name
+model
+input_tokens
+output_tokens
+context_tokens
+queue_wait_ms
+provider_latency_ms
+tool_latency_ms
+retry_count
+http_status
+error_kind
+```
+
+### 为什么 queue_wait 必须单独记
+
+假设 Tool 实际执行只 300ms，但线程池/连接池等了 2 秒：
+
+```text
+service time = 300ms
+queue wait   = 2000ms
+```
+
+如果只看“Tool latency = 2.3s”，很容易误判成业务接口慢。
+
+## 4. 三类典型性能瓶颈怎么判断
+
+### A. Retrieval 瓶颈
+
+现象：
+
+```text
+retrieval P99 很高
+rerank topK 很大
+vector DB CPU 高
+metadata filter 低效
+```
+
+优化顺序：
+
+```text
+先 ACL/metadata filter
+→ ANN candidate 控制
+→ BM25/Dense 并行
+→ fusion
+→ 只对小集合 rerank
+→ parent/context expansion
+```
+
+不要把 200 个候选都送 Cross-Encoder。
+
+### B. LLM 瓶颈
+
+要拆成：
+
+```text
+TTFT（首 Token 时间）
+generation duration
+total input tokens
+output tokens
+round count
+```
+
+很多时候不是“模型慢”，而是 context 太大。
+
+例如：
+
+```text
+20k token prompt → 3.8s TTFT
+4k token prompt  → 1.2s TTFT
+```
+
+这时应该先优化 Context，而不是直接换模型。
+
+### C. Tool 瓶颈
+
+看：
+
+```text
+connection pool acquire
+DNS/TLS
+HTTP RTT
+DB lock/query
+provider 429
+retry amplification
+serialization payload
+```
+
+尤其要查：
+
+```text
+Agent retry 3 次
+Tool Adapter retry 3 次
+HTTP client retry 3 次
+```
+
+理论最坏调用次数：
+
+```text
+3 × 3 × 3 = 27
+```
+
+这类 Retry Amplification 是 Agent 线上常见灾难。
+
+## 5. Loop Amplification：Agent 性能最容易被忽略的根因
+
+Agent 不是普通 RPC，所以必须监控：
+
+```text
+LLM rounds / successful task
+tool calls / successful task
+repeated tool rate
+argument repair count
+replan count
+```
+
+假设：
+
+```text
+Model A 每轮快 20%
+但平均需要 4.2 轮
+
+Model B 每轮慢 10%
+但平均只需要 2.1 轮
+```
+
+最终 Model B 反而可能更快、更便宜。
+
+所以性能优化单位应该是：
+
+> **Cost/Latency per Successful Task**
+
+而不是“单次 LLM latency”。
+
+## 6. nanobot / AgentDock 实际怎么结合
+
+当前 nanobot `AgentHook` 有 iteration 和 Tool execution 生命周期切点，非常适合挂 tracing；`AgentRunner` 是明确的 tool-capable loop，所以可以按 iteration 观测，而不是把整个 Agent 当一个黑盒。
+
+AgentDock 当前 README 明确有：
+
+```text
+Task/Event Stream
+live token meter
+iteration count
+elapsed timer
+mid-flight cancel
+usage dashboard
+```
+
+因此更合理的架构是：
+
+```text
+AgentDock
+  负责 task/container/tenant 级观测
+      ↓
+nanobot AgentHook
+  负责 iteration/tool 级观测
+      ↓
+Java OpenTelemetry
+  负责 HTTP/JDBC/业务服务级观测
+```
+
+最后通过同一个 `trace_id/run_id` 串起来。
+
+## 7. 面试口述版
+
+> Agent 性能不能猜“模型最慢”，我会按一次 Run 的真实生命周期做 Span 拆分：Context、Retrieval、每轮 LLM、每个 Tool、下游 HTTP/SQL、排队和 Retry 都单独测 P50/P95/P99。尤其 Agent 有 Loop Amplification，同一个任务多一轮 LLM、多两次 Tool，影响通常比单次模型快 300ms 更大。实际项目里可以用 AgentDock 看 Task/Token/Iteration，再用 nanobot AgentHook 抓每轮和 Tool 边界，把 traceparent 继续传到 Java 服务和 JDBC，最后优化 Cost/Latency per Successful Task，而不是只优化单个接口。
+
+---
+
+# Q2. 如何搭建 Agent 自动化评测体系？如何量化任务成功率、幻觉率、用户解决率？
+
+## 1. 最大误区：把 Agent Eval 做成“答案相似度”
+
+Agent 不只是生成文字，还做：
+
+```text
+理解
+→ 规划
+→ 检索
+→ Tool Selection
+→ 参数生成
+→ 外部执行
+→ 状态更新
+→ 最终回答
+```
+
+所以 Eval 至少要评四个层次：
+
+```text
+Outcome      最终业务任务有没有完成
+Trajectory   过程是否合理
+Safety       有没有越权/错误副作用
+Efficiency   花了多少轮、多少 Tool、多少 Token
+```
+
+## 2. Golden Case 不是 input + expected text
+
+生产级 case 建议定义：
 
 ```yaml
-case_id: workorder_001
-input: "分析异常能耗，如果确有故障再创建工单"
-env_state: fixture-v3
+case_id: lighting_alarm_017
+input: "分析昨晚高新区异常能耗，有明确故障才创建工单"
+initial_state:
+  project_id: p-101
+  existing_work_orders: []
+fixtures:
+  energy_result: abnormal
+  alarm_result: device_fault
 allowed_tools:
   - query_energy
   - query_alarm
   - create_work_order
+forbidden_tools:
+  - delete_device
 expected_outcome:
-  work_order_created_if_fault_confirmed: true
+  work_order_count: 1
 trajectory_constraints:
-  - must_query_evidence_before_create
-  - must_not_create_if_no_fault
+  - query_energy_before_create_work_order
+  - query_alarm_before_create_work_order
   - create_work_order_at_most_once
+hard_guards:
+  - no_cross_project_access
+  - no_false_success_claim
 graders:
-  - business_outcome
-  - tool_selection
-  - argument_accuracy
-  - policy
+  - business_state
+  - tool_sequence
+  - argument_correctness
   - groundedness
 ```
 
-## 指标体系
+重点是：
 
-任务成功率必须来自业务事实，不是模型自评。
+> **最终正确答案不是唯一判定标准。**
+
+## 3. Task Success Rate 怎么定义
+
+不要让 LLM 自评。
+
+例如“创建工单”的 success 不是模型说：
+
+```text
+已创建工单
+```
+
+而是业务系统真实存在：
+
+```text
+work_order_id != null
+AND project_id == expected_project
+AND status in valid_states
+```
+
+因此：
 
 ```text
 Task Success Rate
-= 成功达成业务目标的 case / 总 case
+= 成功达到业务后置条件的 runs / 总有效 runs
 ```
 
-例如创建工单，最终要查 `work_order_id` 是否真实存在。
+对于纯问答类任务，可以用：
 
-幻觉率至少拆：
+```text
+Reference-based grader
+Evidence-based grader
+Human label
+LLM-as-judge（只能作为一个 grader，不能是唯一事实源）
+```
+
+## 4. 幻觉率不要只定义一个指标
+
+建议拆成：
 
 ```text
 Unsupported Claim Rate
-Wrong Business State Claim Rate
-Citation/Evidence Mismatch Rate
+  没有证据支持的事实性声明比例
+
+Wrong-State Claim Rate
+  与业务真实状态冲突的声明比例
+
+Citation Mismatch Rate
+  引用存在，但引用内容不支持结论
+
+Fabricated Tool Result Rate
+  模型声称 Tool 返回了不存在的数据
 ```
 
-“用户解决率”更适合线上定义：
+特别重要：
+
+```text
+ToolResult.status = UNKNOWN
+```
+
+最终说成：
+
+```text
+退款成功
+```
+
+这是业务幻觉，严重程度远高于普通知识问答的小事实错误。
+
+## 5. 用户解决率怎么量化
+
+“用户满意”非常模糊，建议建立 proxy：
 
 ```text
 Resolved without human takeover
-Resolved without repeat contact in N hours
-User did not immediately correct/reopen
+No reopen within N hours
+No immediate correction
+No same-intent repeated query
+No escalation/complaint
 ```
 
-还要配合：
+例如：
 
 ```text
-Human takeover rate
-User correction rate
-Repeat query rate
-Abandon rate
+Resolution Rate
+= 完成且 N 小时内未重开 / 有效会话数
 ```
 
-## Offline + Online 两套体系
+配合：
 
 ```text
-Offline
+human_takeover_rate
+reopen_rate
+repeat_intent_rate
+user_correction_rate
+abandon_rate
+```
+
+## 6. Offline Eval + Online Eval 必须分开
+
+### Offline
+
+```text
 Golden Set
-Replay
 Tool Mock
-Deterministic Fixtures
+Trajectory Replay
+Failure Fixtures
+Adversarial Cases
+Multiple Trials
+```
 
-Online
+### Online
+
+```text
 Shadow
 Canary
-Real user outcome
-Human takeover
-Complaint/correction
-Business KPI
+Real Business Outcome
+Human Takeover
+User Correction
+Complaint
+Cost/Latency
 ```
 
-## Pi / nanobot / AgentDock 怎么结合
+同一个 case 建议多次运行：
 
-nanobot 的 Hook 可以采集 trajectory；AgentDock 的 task/event/usage 可以补平台层状态；Pi 更适合解释 durable operation/effect 是否按预期收敛；OpenViking 的 retrieval trajectory 可用来区分“Memory 找错”还是“模型用错”。
+```text
+pass_rate = passed_trials / total_trials
+```
 
-## 面试关键句
+因为 Agent 是随机系统，一次成功不能说明稳定。
 
-> Agent Eval 不能只评最终文本，要同时评 outcome、trajectory、safety 和 efficiency。
+## 7. 真正应该建立 Error Taxonomy
+
+例如：
+
+```text
+ROUTER_ERROR
+RETRIEVAL_ERROR
+PLAN_ERROR
+TOOL_SELECTION_ERROR
+ARGUMENT_ERROR
+TOOL_PROVIDER_ERROR
+STATE_MERGE_ERROR
+POLICY_ERROR
+FINAL_SYNTHESIS_ERROR
+```
+
+这样每周才能回答：
+
+```text
+Task Success -3%
+到底是：
+模型退化？
+RAG 退化？
+Tool 503？
+还是 Adapter bug？
+```
+
+## 8. 项目对照
+
+- nanobot：Hook/iteration/tool boundary 非常适合记录 trajectory。
+- AgentDock：Task、Event Stream、token、iteration、success rate 可作为平台级 Eval 数据源。
+- OpenViking：有 retrieval path / session-memory 机制，适合做 Memory/Retrieval 归因，而不是只看最终答案。
+- Pi 类 Harness：适合把 operation/effect state 纳入 outcome grader，例如操作是否真正 settle，而不是只看模型文本。
 
 ---
 
-# Q3. 模型或 Prompt 迭代后，如何做基线对比和灰度验证？
+# Q3. 模型迭代、Prompt 迭代后，如何做基线对比和灰度验证？
 
-## 第一原则：一次尽量只改一类变量
+## 1. Agent 的“版本”不是一个 model name
 
-如果同时换：
-
-```text
-Model
-Prompt
-Tool Schema
-Retriever
-Reranker
-Context Policy
-```
-
-线上成功率涨了也不知道谁贡献，跌了也无法回滚单点。
-
-## 建立 Release Fingerprint
-
-每个 Run 记录：
+一次 Agent 行为受很多版本共同影响：
 
 ```text
 model_version
@@ -280,792 +569,1634 @@ prompt_version
 tool_schema_version
 router_version
 context_policy_version
+memory_policy_version
 retriever_version
 reranker_version
-runtime_version
 knowledge_version
+runtime_version
 ```
 
-这就是“Agent 版本”，不能只记一个 Git commit。
-
-## 发布链
+建议把它们组成：
 
 ```text
-Baseline Golden Set
-      ↓
-Offline Replay
-      ↓
-Hard Guardrail Gate
-      ↓
-Quality / Cost / Latency Compare
-      ↓
-Shadow Traffic
-      ↓
-1% Canary
-      ↓
-5% / 20% / 50%
-      ↓
-Full Rollout
+Release Fingerprint
 ```
 
-### 灰度必须 sticky
+每个 Run 必须落库。
 
-长会话按 `user_id` 或 `session_id` 固定分桶，不能这一轮 Model A、下一轮 Model B，否则 Session/Memory/Context 都被实验污染。
-
-## 怎么判“新版本更好”
-
-不能只看平均分。
-
-优先级通常是：
+如果只记：
 
 ```text
-Hard Guardrail 不退化
-      ↓
-Task Success 不退化
-      ↓
-High-risk subset 不退化
-      ↓
-Latency / Cost 可接受
-      ↓
-长尾 badcase 是否改善
+model = gpt-x
 ```
 
-严重副作用错误必须是 blocking gate，不能被平均分掩盖。
+出现回归后基本没法重现。
+
+## 2. 基线实验最重要原则：控制变量
+
+错误方式：
+
+```text
+模型换了
+Prompt 换了
+Embedding 换了
+Reranker 换了
+Tool Schema 也改了
+```
+
+上线成功率提高 5%，你不知道为什么；下降也不知道回滚谁。
+
+正确做法：
+
+```text
+Experiment A：固定 Tool/RAG/Context，只换 Model
+Experiment B：固定 Model，只换 Prompt
+Experiment C：固定 Model/Prompt，只换 Retriever
+```
+
+复杂改动可以组合发布，但必须先完成局部 ablation。
+
+## 3. 标准发布流水线
+
+```text
+        Candidate Release
+                ↓
+        Offline Golden Replay
+                ↓
+        Hard Guardrail Gate
+                ↓
+      High-risk Subset Regression
+                ↓
+      Cost / Latency Regression
+                ↓
+             Shadow
+                ↓
+          Canary 1% / 5%
+                ↓
+        20% → 50% → 100%
+                ↓
+        Continuous Monitoring
+```
+
+## 4. Hard Guardrail 必须是 blocking gate
+
+例如：
+
+```text
+跨租户数据泄漏
+错误退款
+未确认删除
+把 UNKNOWN 说成 SUCCESS
+```
+
+即使平均 Task Success：
+
+```text
+82% → 87%
+```
+
+只要高风险错误：
+
+```text
+0 → 0.5%
+```
+
+也不能上线。
+
+不要用一个平均总分把严重事故稀释掉。
+
+## 5. 灰度为什么必须 Sticky
+
+长会话如果：
+
+```text
+Turn 1 → Model A
+Turn 2 → Model B
+Turn 3 → Model A
+```
+
+你同时改变了：
+
+```text
+模型行为
+summary
+memory write
+context trajectory
+```
+
+实验已经污染。
+
+应该：
+
+```text
+bucket = hash(user_id or session_id, experiment_id) % 100
+```
+
+在一次会话/实验周期里保持稳定。
+
+## 6. 回滚不能只回 Prompt
+
+因为 Agent 回归可能来自：
+
+```text
+Prompt
+Tool Schema
+Context Policy
+Knowledge Index
+Memory Policy
+Runtime
+```
+
+所以真正可回滚对象应该是整个 Release Fingerprint。
 
 ---
 
 # Q4. Tool 接口超时、抖动、返回空数据时，重试、降级、兜底怎么设计？
 
-## 先分类，后重试
+## 1. 先分类，再决定动作
 
-不能写成：
-
-```text
-catch Exception → retry 3 次
-```
-
-应该先看 Tool Result 类型：
+Tool Failure 推荐至少分成：
 
 ```text
 INVALID_ARGUMENT
+PERMISSION_DENIED
 NO_RESULT
 RATE_LIMIT
 TRANSIENT_NETWORK
 PROVIDER_5XX
 TIMEOUT_READ_ONLY
 TIMEOUT_SIDE_EFFECT
-FORBIDDEN
+BUSINESS_RULE_ERROR
 HARD_ERROR
 UNKNOWN
+CANCELLED
 ```
 
-## Read-only 与 Side-effect 必须分开
-
-查询天气超时，可以有限重试；退款/下单超时不能直接重试，因为外部可能已经成功。
+不能：
 
 ```text
-read-only timeout
-→ exponential backoff + jitter
-→ bounded retry
-
-side-effect timeout
-→ UNKNOWN
-→ query_status / reconcile
-→ 确认 NOT_FOUND 后才允许重试
+catch Exception → retry
 ```
 
-## 空数据也要分类
+## 2. Read-only Tool 和 Side-effect Tool 完全不同
+
+### 查询 Tool
+
+例如：
 
 ```text
+query_weather
+query_device_status
+search_hotel
+```
+
+如果发生临时网络错误：
+
+```text
+bounded retry
++ exponential backoff
++ jitter
+```
+
+通常是安全的。
+
+### 副作用 Tool
+
+例如：
+
+```text
+refund
+create_order
+send_email
+delete_device
+```
+
+超时只说明：
+
+> 调用方没有收到最终结果。
+
+不代表外部没执行。
+
+正确流程：
+
+```text
+POST refund
+    ↓
+Timeout
+    ↓
+UNKNOWN
+    ↓
+query_refund_status(business_request_id)
+    ├─ SUCCESS
+    ├─ PROCESSING
+    ├─ NOT_FOUND → 才考虑安全重试
+    └─ UNKNOWN   → reconcile / human
+```
+
+## 3. 空数据不是一个语义
+
+`[]` 可能表示：
+
+```text
+真的无结果
+权限过滤后为空
+provider 数据延迟
+参数条件过窄
+provider 内部异常被吞掉
+partial response
+```
+
+所以 ToolResult 不应该只返回：
+
+```json
 []
 ```
 
-可能代表：
-
-```text
-真的没有数据
-provider 返回部分空结果
-权限过滤后为空
-参数范围不合理
-上游异常吞掉了错误
-```
-
-所以 Canonical ToolResult 应带：
+更合理：
 
 ```json
 {
   "status": "NO_RESULT",
-  "reason": "NO_FLIGHTS_FOR_DATE",
+  "reason": "NO_FLIGHTS_MATCH_FILTER",
   "retryable": false,
-  "data": [],
-  "source": "provider-a",
-  "request_id": "r-1"
+  "provider": "flight-a",
+  "request_id": "req-12",
+  "data": []
 }
 ```
 
-而不是只返回空数组。
+## 4. Retry 必须有唯一 Owner
 
-## Retry Budget
-
-至少包含：
+常见错误：
 
 ```text
-per-attempt timeout
-max_attempts
-backoff
-jitter
-global deadline
-provider circuit breaker
-bulkhead
+HTTP client retry
++
+Tool adapter retry
++
+Agent retry
 ```
 
-避免 HTTP Client 重 3 次、Tool Runtime 重 3 次、Agent 又重 3 次，最坏放大 27 倍。
+会指数放大。
 
-## nanobot 当前实现可以怎么讲
+建议：
 
-当前 Tool execution 会把 Tool Error 变成 Observation，同时已有 repeated external lookup guard；它能阻止模型对同一个外部 lookup 无意义重复调用。但业务级 fallback、provider circuit breaker、side-effect reconcile 仍应由 Tool Adapter / Java 业务服务补齐。
+```text
+Transport 层：只处理连接级瞬时失败，且次数非常有限
+Tool Runtime：拥有统一 retry policy
+Agent：看到结构化失败后决定语义策略，不重复同参数 blind retry
+```
+
+## 5. Circuit Breaker
+
+状态：
+
+```text
+CLOSED
+  ↓ failure threshold
+OPEN
+  ↓ cooldown
+HALF_OPEN
+  ├─ success → CLOSED
+  └─ failure → OPEN
+```
+
+当某供应商已经连续失败时，不应该让 1000 个 Agent 各自“聪明地再试一次”。
+
+## 6. Fallback Ladder
+
+例如酒店 Tool：
+
+```text
+Primary Provider
+    ↓ unavailable
+Secondary Provider
+    ↓ unavailable
+Cached Snapshot
+    ↓ stale but acceptable?
+Structured Degrade Message
+    ↓
+Ask user / fail gracefully
+```
+
+关键是：
+
+> Fallback 必须显式标注数据时效和能力差异，不能用旧缓存冒充实时数据。
+
+## 7. nanobot 当前源码边界
+
+当前 `nanobot/agent/tools/execution.py` 会：
+
+```text
+prepare_call
+→ execute
+→ error 变 Observation
+→ repeated_external_lookup_error 检测
+```
+
+并且会阻止重复外部查询。
+
+但当前这段执行代码本身是直接 `await tool.execute(...)`，并没有在这一层自动包一套企业级：
+
+```text
+per-tool timeout
+circuit breaker
+provider fallback
+side-effect reconcile
+```
+
+这些应由 Tool Wrapper / Runtime Policy / Java Domain Service 补齐。
+
+这正是面试里最应该说明的“当前实现 vs 企业补强”。
 
 ---
 
-# Q5. 怎么区分是模型输出问题，还是下游 Tool/业务接口问题？如何快速定位根因？
+# Q5. 如何区分是模型输出问题，还是下游 Tool / 业务接口问题？怎么快速定位根因？
 
-## 核心：保留完整因果链
-
-一次失败至少拆成：
+## 1. 必须保留完整 Causal Chain
 
 ```text
-Model Input
-  ↓
-Model Output / Tool Proposal
-  ↓
+Context Snapshot
+      ↓
+Model Response
+      ↓
+Tool Proposal
+      ↓
 Schema / Policy
-  ↓
-Tool Request
-  ↓
-Downstream Response
-  ↓
-ToolResult Normalization
-  ↓
-Next Model Turn
-  ↓
-Final Outcome
+      ↓
+Normalized Tool Request
+      ↓
+Downstream Request
+      ↓
+Raw Provider Response
+      ↓
+Normalized ToolResult
+      ↓
+Next Model Input
+      ↓
+Final Answer
+      ↓
+Business Outcome
 ```
 
-## 归因规则
+任意一段丢失，就容易错误归因。
 
-如果：
+## 2. 一个真实故障如何归因
+
+用户：
 
 ```text
-模型选错 Tool
-→ Model / Router / Prompt 问题
+查 A 项目的昨晚异常灯具
 ```
 
-如果 Tool 正确但参数错：
+情况 A：
 
 ```text
-Argument Generation / Context 问题
+模型调用 query_energy
+但正确应该 query_alarm
 ```
 
-如果请求参数正确，下游 500：
+→ `TOOL_SELECTION_ERROR`
+
+情况 B：
 
 ```text
-Provider / Service 问题
+Tool 正确
+project_id 却生成 B
 ```
 
-如果下游返回 SUCCESS，但 Adapter 映射成 UNKNOWN：
+→ `ARGUMENT_ERROR / CONTEXT_ERROR`
+
+情况 C：
 
 ```text
-Tool Adapter 问题
+参数正确
+Java API 返回 500
 ```
 
-如果 ToolResult 正确，模型最终却说错：
+→ `TOOL_PROVIDER_ERROR`
+
+情况 D：
 
 ```text
-Result Use / Final Synthesis 问题
+API 返回 SUCCESS
+Adapter 误映射成 UNKNOWN
 ```
 
-## 建议统一 error taxonomy
+→ `ADAPTER_MAPPING_ERROR`
+
+情况 E：
 
 ```text
-MODEL_SELECTION_ERROR
-ARGUMENT_ERROR
-POLICY_DENIED
-TOOL_TIMEOUT
-TOOL_5XX
-TOOL_BAD_DATA
-ADAPTER_MAPPING_ERROR
-STATE_MERGE_ERROR
-FINAL_SYNTHESIS_ERROR
+ToolResult 明确写 NO_RESULT
+模型却说找到 10 个异常灯具
 ```
 
-有 taxonomy 后，Badcase 才能按根因统计，而不是所有失败都叫“幻觉”。
+→ `RESULT_USE / FINAL_SYNTHESIS_ERROR`
 
-## Trace 字段
+## 3. 快速定位需要哪些字段
 
 ```text
+trace_id
 run_id
 turn_id
 iteration
-tool_call_id
-model/provider
+model_version
 prompt_version
-tool_name
+context_hash
+selected_tool
+tool_call_id
 args_hash
+policy_result
+provider_request_id
 http_status
-error_kind
-result_status
-business_request_id
+raw_result_hash
+tool_result_status
+business_state
+final_answer_hash
 ```
 
-这也是为什么 Agent 系统一定要做 trajectory observability。
+最重要的一点：
+
+> 不要只记录最终 Prompt 和最终答案。
+
+否则中间 Tool/State 丢了，就无法重放。
+
+## 4. Replay 是故障定位的关键
+
+两种 Replay：
+
+### Freeze Tool，重跑 Model
+
+```text
+固定历史 Tool Result
+→ 换 Prompt / Model
+```
+
+如果问题消失，说明偏模型侧。
+
+### Freeze Model Output，重跑 Harness
+
+```text
+固定 Tool Call
+→ 重跑 Adapter / Policy / State Transition
+```
+
+如果结果变化，说明 Runtime/Tool 侧。
+
+这是比“看日志猜原因”更成熟的方法。
 
 ---
 
-# Q6. 大量无效 Tool 调用会拉高成本、拖慢 QPS，怎么做限流和拦截？
+# Q6. 大量无效 Tool 调用会拉高成本、拖慢 QPS，做过哪些限流与拦截机制？
 
-## 无效调用通常分三类
+## 1. 先定义什么叫“无效 Tool”
+
+至少四类：
 
 ```text
-不该调用 Tool 却调用了
-选错 Tool
-同一个 Tool + 同参数重复调用
+Should-not-call
+  本来不需要 Tool，却调用了
+
+Wrong-tool
+  应该调用 A，却调用 B
+
+Duplicate-call
+  相同 Tool + 相同参数重复
+
+No-progress-call
+  参数略变，但没有获取任何新信息
 ```
 
-## 第一层：模型可见 Tool 减少
+最后一种比“完全相同参数”更难发现。
 
-不要把 100 个 Tool 全塞给模型。先按 domain/role/task 做 capability projection：
+## 2. 第一层：减少模型可见 Tool
+
+如果系统有 200 个 Tool，不应该每轮把 200 个 schema 全塞给模型。
+
+可以：
 
 ```text
-Full Registry
-   ↓
-Role/Intent Filter
-   ↓
-本轮只暴露 5～15 个候选 Tool
+Intent / Domain Router
+      ↓
+Candidate Tool Set
+      ↓
+Role/Permission Filter
+      ↓
+Model-visible Tool View
 ```
 
-## 第二层：Runtime 拦截
-
-维护：
+例如照明项目问设备：
 
 ```text
-tool_call_count
-same_tool_args_count
-provider_call_count
-repair_count
-cost_budget
+query_device
+query_alarm
+query_energy
+```
+
+不要暴露：
+
+```text
+refund
+flight_search
+send_marketing_email
+```
+
+这同时降低：
+
+```text
+Token
+Tool confusion
+Security surface
+```
+
+## 3. 第二层：Action Fingerprint
+
+```text
+fingerprint = hash(
+  tool_name,
+  normalized_args,
+  relevant_state_version
+)
+```
+
+同一 Run 里：
+
+```text
+same fingerprint
++
+same observation
++
+no new evidence
+```
+
+重复出现时直接拦截。
+
+当前 nanobot 已经有 `repeated_external_lookup_error(...)`，这就是很实际的 Runtime Guard，而不是靠 Prompt 说“不要重复查询”。
+
+## 4. 第三层：多维 Budget
+
+```text
+max_iterations
+max_tool_calls
+max_calls_per_tool
+max_duplicate_calls
+max_argument_repairs
+max_external_lookups
+max_cost
 wall_clock_deadline
 ```
 
 例如：
 
 ```text
-same tool + normalized args + same state
-连续出现 N 次
-→ block
-→ NO_PROGRESS
+search_web max 5/run
+query_order max 3/run
+refund max 1 logical action
 ```
 
-nanobot 当前 `execute_tool_calls()` 已经会检查 repeated external lookup，并返回错误 Observation，这就是很好的真实实现案例。
+## 5. 第四层：QPS / Concurrency Control
 
-## 第三层：资源级限流
+建议按：
 
 ```text
-per-user
-per-tenant
-per-tool
-per-provider
-per-agent
+tenant
+user
+agent
+provider
+tool
 ```
 
-Tool QPS 不能只按 HTTP 入口限，因为一个用户请求可能产生 20 个下游调用。
+分别做 token bucket / semaphore。
 
-## 第四层：Bulkhead / Circuit Breaker
+为什么不能只按 HTTP Request 限流？
 
-不同 Tool 分资源池：
+因为：
 
 ```text
-LLM slots
-DB slots
-external API slots
-MCP slots
+1 个用户请求
+→ 5 次 LLM
+→ 12 次 Tool
+→ 8 次 DB
 ```
 
-某一个外部供应商雪崩时，不拖死所有 Agent 请求。
+真实资源消耗是 fan-out 的。
+
+## 6. Bulkhead
+
+不要让慢 Tool 把整个系统拖死。
+
+例如：
+
+```text
+flight provider pool  = 20 concurrent
+hotel provider pool   = 50 concurrent
+web search pool       = 30 concurrent
+DB query pool         = 40 concurrent
+```
+
+某一个 provider 卡死，不应该耗尽所有 worker。
 
 ---
 
 # Q7. Redis 在 Agent 系统中到底存什么？会话状态、缓存结果、用户记忆怎么区分？
 
-## 核心原则
+## 1. 最重要的答案：Redis 不是“Agent 数据库”
 
-Redis 更适合：
-
-> 高频、短生命周期、并发协调、允许重建的热状态。
-
-而不是所有 Agent 数据的最终事实库。
-
-## 适合 Redis
+Redis 最适合：
 
 ```text
-session hot state
-run_id → instance_id routing
-stream cursor
-rate limit counter
-idempotency hot key
-lease / lock
-short-lived tool cache
-worker heartbeat
-pending approval
+短生命周期
+高频读写
+协调型
+可重建
 ```
 
-## 不建议只放 Redis
+不应该因为它快，就把所有长期事实塞进去。
+
+## 2. 推荐的五层数据模型
 
 ```text
-durable transcript
-business order/refund state
-audit trail
-long-term user memory 原始事实
-important checkpoint 唯一副本
+Redis
+  → Hot Session State / Routing / Rate Limit / Lease / Cursor
+
+Postgres
+  → Durable Task / Audit / Tenant / Business Metadata
+
+Transcript Store
+  → Durable Conversation / Tool Event
+
+OpenViking / Memory Store
+  → Long-term Memory / Resource / Skill
+
+Business DB
+  → Order / Device / Refund / WorkOrder 真相
 ```
 
-## 三类数据要彻底区分
+## 3. Redis 具体可以放什么
 
-### Session State
-
-当前对话/Run 的热状态，例如：
+### Session Hot State
 
 ```text
-current_run
-last_seq
-active_turn
-pending_approval
+agent:session:{tenant}:{session_id}
 ```
 
-生命周期：分钟～小时。
+内容：
 
-### Cache
+```json
+{
+  "active_run_id":"r-91",
+  "instance_id":"agent-3",
+  "last_seq":391,
+  "state_version":12,
+  "expires_at":"..."
+}
+```
 
-Tool 查询结果，例如天气、设备状态、知识查询结果。
+### Run Routing
 
-生命周期：秒～分钟，必须带 tenant/scope/version。
+```text
+run:{run_id}:instance → container_id
+```
 
-### Long-term Memory
+用于 WebSocket/SSE 断线重连后找到当前 Runtime。
 
-用户长期偏好、稳定事实、历史经验。
+### Rate Limit
 
-生命周期：跨 Session，需要 provenance、版本、冲突和删除能力，应该有独立 Memory/Context Store，例如 OpenViking 或持久数据库。
+```text
+quota:{tenant}:{tool}:{window}
+```
 
-## 面试关键句
+### Idempotency / Short Lease
 
-> Redis 是 Hot Coordination Layer，不是 Memory System 的同义词。
+```text
+idem:{tenant}:{business_request_id}
+lock:{session_id}
+```
+
+注意：真正副作用幂等最好仍由业务服务识别，不能只靠 Redis key。
+
+### Short-lived Tool Cache
+
+缓存查询型 Tool：
+
+```text
+device_status:{project}:{device}:{version}
+```
+
+需要 TTL + source version。
+
+## 4. 用户长期记忆不应该直接等于 Redis Value
+
+用户偏好需要：
+
+```text
+provenance
+scope
+confidence
+validity
+updated_at
+conflict policy
+```
+
+这些更像 Memory Store / Context DB 的职责。
+
+OpenViking 当前明确把：
+
+```text
+resources
+memories
+skills
+```
+
+组织在 `viking://` 下，并且 Session commit 后会做 Memory extraction/merge/skip，这比“Redis 存 user_profile JSON”成熟很多。
+
+## 5. AgentDock 实际边界
+
+当前 AgentDock README 明确 Control Plane 以 Postgres 做持久化，而且是多租户 workspace 模型，并不是“Redis 原生 Session 平台”。
+
+所以面试时应该说：
+
+> 如果在 AgentDock 上加 Redis，我会用它做 hot routing、stream cursor、rate limit、lease、短缓存；Tenant/Agent/Task 的耐久状态仍然放 Postgres，不能为了快把 Source of Truth 搬进 Redis。
+
+这类回答比“Redis 存 Session”更有工程含量。
 
 ---
 
-# Q8. 多用户高并发同时在线，如何做 Session 隔离和 Memory 隔离，避免串话？
+# Q8. 多用户高并发同时在线，怎么做 Session 隔离、Memory 隔离，避免会话串扰？
 
-## 隔离维度至少四层
-
-```text
-Tenant
-  ↓
-User
-  ↓
-Agent Instance
-  ↓
-Session / Conversation / Run
-```
-
-每条数据都应有明确 scope。
-
-## Key / Record 设计
-
-```text
-session:{tenant}:{user}:{session_id}
-run:{tenant}:{session_id}:{run_id}
-```
-
-Memory 记录则至少包含：
+## 1. 隔离必须至少有四个维度
 
 ```text
 tenant_id
-subject_user_id
-scope
-source_session_id
-memory_type
-acl
+user_id
+agent_id
+session_id
 ```
 
-不能只靠向量相似度召回 Memory，必须先做 tenant/user/scope filter。
+不是只有 `session_id`。
 
-## 最危险的串话来源
-
-不是只有 Redis key 写错，还包括：
+一个典型资源主键：
 
 ```text
-共享全局 in-memory dict
-vector DB 没有 tenant filter
-cache key 缺少 user/project
-异步 Worker 结果没有 session/run id
-WebSocket 重连后旧 run result 写进新 run
+(tenant_id, user_id, agent_id, session_id)
 ```
 
-## AgentDock 作为真实平台案例
+## 2. 每一层都必须携带 Scope
 
-AgentDock 的 Workspace/Tenant/Agent/Container 边界很适合解释平台级隔离：不同 Agent 实例可以放独立容器和 workspace；但 Runtime 内的 Session、Memory scope 仍需要继续细分，不能认为“容器隔离了就不会串会话”。
-
-## 一致性
-
-同一 Session 多端并发时建议：
+### Session
 
 ```text
-session_version
-+ CAS / optimistic lock
-+ per-session actor/queue
-+ run_id / seq
+session_key = tenant/user/agent/session
 ```
 
-不要只靠一把 Redis Lock。
+### Memory
+
+```text
+memory.subject_id
+memory.tenant_id
+memory.scope
+```
+
+### RAG
+
+检索前必须 ACL filter：
+
+```text
+WHERE tenant_id = current_tenant
+AND visibility in allowed_scope
+```
+
+不能先向量召回全库，再在最终答案里“希望模型不要泄露”。
+
+### Tool
+
+每次调用都带 authenticated principal：
+
+```text
+user_id
+tenant_id
+roles
+project_scope
+```
+
+Java Service 必须二次授权。
+
+## 3. 高并发同一个 Session 怎么办
+
+最简单的安全模型：
+
+```text
+single writer per session
+```
+
+也就是：
+
+```text
+Session Actor / Queue
+```
+
+同一个 Session 的状态变更串行；不同 Session 并行。
+
+如果一定支持并发写，就必须：
+
+```text
+state_version
+CAS
+plan_version
+message_seq
+```
+
+例如：
+
+```text
+worker result.plan_version = 7
+current plan_version       = 8
+```
+
+结果必须标记 `STALE`，不能写回当前状态。
+
+## 4. AgentDock 的实际案例
+
+AgentDock 当前 README 明确：
+
+```text
+multi-tenant workspaces
+owner/admin/member
+每用户绑定实例
+独立 agent container
+persistent workspace
+```
+
+这是平台级隔离。
+
+但即使每个 Agent 在独立容器，业务 Tool 仍必须检查：
+
+```text
+user/project permission
+```
+
+容器隔离解决的是 Runtime/Filesystem 边界，不能替代业务授权。
+
+## 5. OpenViking 的路径模型很适合解释 Memory 隔离
+
+当前 README 示例：
+
+```text
+viking://user/{user_id}/memories/
+viking://user/{user_id}/resources/
+viking://user/{user_id}/skills/
+```
+
+这说明长期 Context 应该天然带 subject scope。
+
+企业多租户进一步加：
+
+```text
+tenant → user → scope
+```
+
+避免 A 用户 memory 召回给 B 用户。
 
 ---
 
-# Q9. 短期滑动窗口记忆、长期用户画像记忆如何分层？
+# Q9. 短期滑动窗口记忆、长期用户画像记忆如何分层设计？
 
-## 先分五层
+## 1. 先纠正概念
+
+下面几个东西不是同一个 Memory：
 
 ```text
-Durable Transcript
+Recent Conversation Window
+Session Summary
 Runtime State
-Short-term Working Context
-Long-term Memory
+Long-term User Memory
 Business State
 ```
 
-短期“记忆”本质上更接近 Working Context，不等于长期 Memory。
-
-## 推荐分层
+尤其：
 
 ```text
-L0 Current Turn
-  当前用户输入、当前 Tool Result
+Context Window ≠ Memory Store
+```
 
-L1 Recent Window
-  最近 N 轮原始消息
+Context Window 只是本轮模型能看到的输入。
+
+## 2. 推荐四层设计
+
+```text
+L1 Recent Raw Turns
+   最近 N 轮原文
 
 L2 Session Summary
-  当前任务/主题的压缩摘要
+   较老对话的语义摘要
 
-L3 Long-term Memory
-  跨 Session 的稳定偏好/事实/经验
+L3 Structured Session Facts
+   当前 goal / constraints / IDs / state
 
-L4 External Resource
-  文档、知识、Skill、项目资料
+L4 Long-term Memory
+   跨 Session 的稳定偏好/事实/经验
 ```
 
-## 写入策略
-
-用户说：
-
-> “今天中午想吃辣一点。”
-
-不应该自动升级成：
+最终 Context：
 
 ```text
-用户永远喜欢辣
-```
-
-长期 Memory 要走 admission：
-
-```text
-Candidate
-→ type classify
-→ importance/stability/confidence
-→ dedup/conflict
-→ write/update/ignore
-```
-
-## OpenViking 怎么对照
-
-OpenViking 适合把长期 resource/memory/skill 按分层 Context 管理；nanobot `ContextGovernor` 则解决本轮哪些信息真正进入 model-facing context。两者不是同一个层。
-
----
-
-# Q10. Memory 库持续膨胀，检索精度下降，怎么迭代优化？
-
-## 根因不是只有“向量太多”
-
-Memory 膨胀通常有四种问题：
-
-```text
-重复 Memory
-过期 Memory
-冲突 Memory
-低价值 Memory
-```
-
-向量数量只是表现。
-
-## 写入侧先治理
-
-比检索侧加更强 Embedding 更重要的是 Admission Precision。
-
-```text
-每轮都写
-→ 高噪声
-→ duplicate/conflict 增长
-→ retrieval precision 下降
-```
-
-所以先做：
-
-```text
-Dedup
-Conflict Detection
-Scope
-TTL / Expiration
-Version
-Confidence
-Importance
-Provenance
-```
-
-## 检索侧
-
-不要只做全库 TopK embedding：
-
-```text
-subject filter
-memory_type filter
-scope filter
-freshness filter
-semantic retrieval
-rerank
-```
-
-用户当前明确指令要优先于旧 Memory。
-
-## Consolidation
-
-定期把相似 episodic memory 合并成更稳定的抽象：
-
-```text
-10 条酒店记录
-→ “用户通常偏好安静、交通方便的酒店”
-```
-
-但原始 evidence/ref 最好保留，不能让抽象成为不可追溯真相。
-
-## 评测
-
-重点看：
-
-```text
-Memory precision
-stale recall rate
-cross-user leakage
-wrong-memory usage rate
-user correction rate
-downstream task success
-```
-
----
-
-# Q11. Token 溢出的多级兜底策略怎么设计？
-
-## Token overflow 不应该等模型 API 报错才处理
-
-每一轮模型调用前，都应有 token budget estimator。
-
-```text
-System
-+ Policy
-+ Tool Schema
+System/Policy
 + Active State
-+ Recent Turns
++ Recent Raw Turns
 + Summary
-+ Memory/RAG
-+ Tool Results
-= estimated tokens
++ Relevant Long-term Memory
++ RAG/Resource
++ Latest Tool Results
 ```
 
-接近阈值时进入分级治理。
+## 3. Long-term Memory 不能每轮都写
 
-## 推荐多级兜底
+需要 Admission：
 
 ```text
-Level 0
-正常 Context Projection
-
-Level 1
-截断/摘要超大 Tool Result
-→ Artifact + digest
-
-Level 2
-减少低优先级 RAG/Memory
-→ topK / L0-L1 优先
-
-Level 3
-压缩旧对话
-→ Summary + Recent Raw Turns
-
-Level 4
-减少 Tool Schema
-→ Progressive Disclosure
-
-Level 5
-切更大 context model（如果策略允许）
-
-Level 6
-明确向用户澄清/分任务
+Conversation
+    ↓
+Candidate Extraction
+    ↓
+Memory Type
+    ├─ stable fact
+    ├─ preference
+    ├─ episodic experience
+    └─ discard
+    ↓
+Importance / Stability / Confidence
+    ↓
+Dedup / Conflict
+    ↓
+Write / Merge / Skip
 ```
 
-## 绝不能被压掉的东西
+OpenViking 当前 README 也明确：Session commit 后做后台 extraction，并将 candidate 与已有 memory 比较，决定 create / merge / skip。
+
+这就是很好的真实案例。
+
+## 4. 用户画像要做 Scope
+
+错误：
 
 ```text
-Hard Policy
-Current Goal
-Current Runtime State
-User confirmed irreversible action
-Unclosed Tool Call / Tool Result pair
-Critical IDs / amounts / deadlines
+用户喜欢夜生活酒店
 ```
 
-## nanobot 当前怎么对照
+可能只是这一次旅行。
 
-`ContextGovernor` 的职责就是治理 model request context，同时不破坏 persisted history；因此可以把“Durable Transcript”和“Model-facing Context”分开。企业层可以再在其前面加入 Memory/RAG 优先级和 Tool Schema progressive disclosure。
+更合理：
+
+```text
+scope = trip:tokyo-2026
+preference = nightlife
+```
+
+而全局偏好可能是：
+
+```text
+scope = global
+preference = quiet_room
+```
+
+Context Builder 按“更具体 scope 优先”加载。
 
 ---
 
-# Q12. Agent 出现 Tool 死循环、重复调用同一接口，怎么检测、截断并终止流程？
+# Q10. Memory 库持续膨胀、检索精度下降，迭代优化方案是什么？
 
-## 只设 max_iterations 不够
+## 1. Memory 膨胀的本质不是“数据太多”
 
-如果模型每轮都：
+真正问题是：
 
 ```text
-weather(city=Taipei)
-→ NO_RESULT
-→ weather(city=Taipei)
-→ NO_RESULT
-→ ...
+重复
+冲突
+陈旧
+低价值
+错误写入
+scope 太宽
+embedding space 噪声增加
 ```
 
-等到 max_iterations 才停，成本已经浪费。
+所以“换更大的向量库”解决不了根因。
 
-## No-progress Fingerprint
+## 2. 先做 Memory Write Quality
 
-对每次动作生成：
+指标：
+
+```text
+Admission Precision
+Duplicate Rate
+Conflict Rate
+Correction Rate
+Wrong-memory Write Rate
+```
+
+如果 50% 写入本身就是垃圾，检索层再调 TopK 也没用。
+
+## 3. Dedup / Merge / Supersede
+
+Memory Record 建议：
+
+```json
+{
+  "memory_id":"m-1",
+  "subject":"u-1",
+  "type":"preference",
+  "scope":"global",
+  "content":"prefers quiet rooms",
+  "confidence":0.92,
+  "source":"session-99",
+  "valid_from":"...",
+  "valid_to":null,
+  "supersedes":null,
+  "last_verified_at":"..."
+}
+```
+
+更新时不是无限 append：
+
+```text
+NEW
+├─ same fact          → merge/update confidence
+├─ conflicts          → supersede or scope split
+├─ lower confidence   → keep old / ignore
+└─ unrelated          → create new
+```
+
+## 4. TTL 不能简单按时间删除
+
+有些 Memory：
+
+```text
+用户生日
+```
+
+几年仍有效。
+
+有些：
+
+```text
+这周出差上海
+```
+
+一周就失效。
+
+所以需要：
+
+```text
+memory_type-specific retention
+valid_from / valid_to
+last_verified_at
+freshness score
+```
+
+## 5. Retrieval 不要全库裸搜
+
+先过滤：
+
+```text
+subject
+scope
+domain
+memory_type
+freshness
+permission
+```
+
+再向量检索。
+
+例如：
+
+```text
+WHERE subject_id = user
+AND scope in current_scope_chain
+AND valid_to > now
+```
+
+之后 Dense/BM25 才有意义。
+
+## 6. Memory Retrieval 也要 Eval
+
+不能只看 Recall。
+
+至少：
+
+```text
+Precision@K
+Wrong-memory Usage Rate
+Stale Recall Rate
+Cross-user Leakage Rate
+User Correction Rate
+Downstream Task Success
+```
+
+一个“召回率 95%”的 Memory 系统，如果经常多召回错误偏好，反而比不召回更差。
+
+## 7. OpenViking 对这题的启发
+
+OpenViking 当前把 Context 做成目录结构，并有：
+
+```text
+L0 Abstract
+L1 Overview
+L2 Detail
+```
+
+以及 Session Memory extraction/create/merge/skip。
+
+这说明长期 Memory 治理的方向不是：
+
+```text
+全量向量化 → topK
+```
+
+而是：
+
+```text
+组织
+→ 分层
+→ 筛选
+→ 再检索
+→ 按需加载
+```
+
+---
+
+# Q11. Token 溢出的多级兜底策略是什么？
+
+## 1. Token Overflow 不应该到 API 报 400 才处理
+
+Context Builder 在发 LLM 前就应该维护 Budget。
+
+例如：
+
+```text
+context_window = 128k
+reserve_output = 8k
+safety_margin  = 5k
+
+input_budget = 115k
+```
+
+然后按优先级分配。
+
+## 2. 推荐 Context Priority
+
+```text
+P0 System / Security Policy
+P1 Active Goal / Hard Constraints
+P2 Runtime State
+P3 Current Tool Observation
+P4 Recent User/Assistant Turns
+P5 Relevant Memory / RAG
+P6 Older Summary
+P7 Low-value History
+```
+
+Token 不够时从低优先级开始降级。
+
+## 3. 多级兜底 Ladder
+
+```text
+Level 0  正常 Context
+   ↓ overflow risk
+Level 1  Tool Result 截断 / Artifact 化
+   ↓
+Level 2  RAG topK / memory candidate 减少
+   ↓
+Level 3  Older Turns → Segment Summary
+   ↓
+Level 4  Rolling/Hierarchical Summary
+   ↓
+Level 5  只保 Active State + Recent Window
+   ↓
+Level 6  Stronger compaction / larger-context model
+   ↓
+Level 7  要求用户开启新任务 / 明确上下文边界
+```
+
+## 4. 大 Tool Result 不应该直接塞回模型
+
+例如 SQL 返回 20MB：
+
+错误：
+
+```text
+全部 stringify → Tool Message
+```
+
+正确：
+
+```text
+Raw Result
+   ↓
+Artifact Store / File / DB
+   ↓
+Digest
++ schema
++ row_count
++ anomalies
++ artifact_id
+   ↓
+LLM
+```
+
+模型需要细节时再读取指定部分。
+
+## 5. 不能压掉什么
+
+绝不能因为 Token 紧张就丢：
+
+```text
+pending tool call/result pair
+current business state
+user confirmation
+security constraint
+critical IDs
+```
+
+否则 Runtime 语义被破坏。
+
+## 6. nanobot 当前真实实现
+
+当前 `ContextGovernor` 明确负责：
+
+> model-request context while preserving persisted history
+
+并且 `AgentRunSpec` 有 `max_tool_result_chars`、`context_window_tokens` 等治理参数。
+
+这说明 nanobot 的正确设计方向本身就是：
+
+```text
+Durable History
+≠
+Model-facing Context
+```
+
+Token 超限应该裁剪模型视图，而不是把 durable transcript 真删掉。
+
+## 7. OpenViking 的 L0/L1/L2 怎么配合
+
+OpenViking 当前的三层：
+
+```text
+L0 Abstract
+L1 Overview
+L2 Full Detail
+```
+
+适合做 Progressive Disclosure：
+
+```text
+先拿 L0 判断相关性
+→ 需要时拿 L1
+→ 真正用到再拿 L2
+```
+
+它解决“外部 Context 加载多少”；nanobot ContextGovernor 解决“本轮最终发送多少”。
+
+两者是互补关系。
+
+---
+
+# Q12. Agent 出现 Tool 死循环、重复调用同一接口，如何检测、截断并终止流程？
+
+## 1. 这题不能只答 max_iterations
+
+`max_iterations=20` 只能保证：
+
+```text
+最迟第 20 轮死
+```
+
+不能保证第 4 轮发现它已经没有进展。
+
+真正需要：
+
+```text
+Loop Budget
++
+Repeated Action Detection
++
+No-progress Detection
++
+Progress State Machine
+```
+
+## 2. 第一层：Exact Duplicate Detection
+
+定义：
 
 ```text
 fingerprint = hash(
   tool_name,
-  normalized_args,
-  relevant_state_version,
-  result_code
+  normalize(args),
+  relevant_state_version
 )
 ```
 
-连续出现相同 fingerprint：
+连续出现：
 
 ```text
-N >= threshold
-→ REPEATED_ACTION
-→ block same call
-→ ask model to change strategy
+search_flight({from:A,to:B,date:D})
 ```
 
-如果后续仍无新 evidence：
+且没有新增 Context，直接 block。
+
+当前 nanobot `execute_tool_calls()` 在真正执行前就调用 `repeated_external_lookup_error()`，发现重复外部 lookup 后返回：
+
+```text
+repeated external lookup blocked
+```
+
+而不是继续访问 provider。
+
+这个就是实际源码级案例。
+
+## 3. 第二层：Semantic No-progress Detection
+
+有时模型会“假装换参数”：
+
+```text
+search(q="上海酒店")
+search(q="上海的酒店")
+search(q="上海住宿")
+```
+
+fingerprint 不同，但本质没进展。
+
+可以维护：
+
+```text
+ProgressState
+- evidence_ids
+- known_facts
+- unresolved_constraints
+- state_version
+- last_error_kind
+```
+
+如果 N 轮后：
+
+```text
+new_evidence_count = 0
+state_version unchanged
+same error category
+```
+
+进入：
 
 ```text
 NO_PROGRESS
-→ stop / clarify / fallback / human
 ```
 
-## 不只检查“完全相同参数”
-
-模型可能做这种伪变化：
-
-```text
-query(city="Taipei")
-query(city="Taipei City")
-query(city="台北")
-```
-
-所以还可以记录：
-
-```text
-semantic action class
-provider endpoint
-normalized entity set
-same error code
-new evidence count
-```
-
-## Budget
-
-最终还要有硬预算：
+## 4. 第三层：Loop Budget
 
 ```text
 max_iterations
 max_tool_calls
 max_same_tool_calls
+max_external_lookups
 max_argument_repairs
 max_replans
-max_subagent_depth
-token budget
-cost budget
-global deadline
+max_cost
+wall_clock_deadline
 ```
 
-## nanobot 当前真实案例
+注意：
 
-当前 `nanobot/agent/tools/execution.py` 在 Tool 执行前会调用 `repeated_external_lookup_error(...)`，检测重复外部 lookup；如果命中，会返回 `repeated external lookup blocked` 的错误 Observation，而不是继续真正执行 Tool。它还会把 Tool 执行事件记录为 `name/status/detail`。这非常适合面试时解释：
+> 一轮 LLM 可以产生多个 Tool Call，所以 `max_iterations` 不能代替 `max_tool_calls`。
 
-> 死循环不能只靠 Prompt 说“不要重复”，Runtime 必须保存动作历史并在执行边界硬拦截。
+## 5. 第四层：Escalation Ladder
 
-## 收敛策略
+检测 no-progress 后不要立刻粗暴失败，可以：
 
 ```text
-same action blocked
+1. structured feedback
       ↓
-change tool / change params
+2. 禁止重复 action
       ↓
-仍无新 evidence
+3. 要求换 Tool / strategy
       ↓
-clarify user
+4. stronger model / reviewer
       ↓
-fallback / graceful failure
+5. clarify user
+      ↓
+6. human escalation
+      ↓
+7. graceful stop
 ```
+
+但是每一级都必须受总 Budget 约束。
+
+## 6. Tool Error 要提供“下一步语义”
+
+比：
+
+```text
+Error 400
+```
+
+更好的是：
+
+```json
+{
+  "status":"NO_PROGRESS",
+  "tool":"search_flight",
+  "reason":"same logical query repeated without new evidence",
+  "retryable":false,
+  "allowed_next_actions":[
+    "CHANGE_CONSTRAINT",
+    "ASK_USER",
+    "STOP"
+  ]
+}
+```
+
+模型才更容易收敛。
 
 ---
 
-# 一张图串起这 12 道题
+# 13. 把 12 道题串起来：生产级 Agent 的真正闭环
+
+这组题最终可以收敛成一张图：
 
 ```text
-                    AgentDock
-           Task / Tenant / Container / Stream
-                        │
-                        ▼
-                    Agent Runtime
-                        │
-     ┌──────────────────┼──────────────────┐
-     ▼                  ▼                  ▼
- Context / Memory      LLM Round          Tool Runtime
-     │                  │                  │
-OpenViking          model/prompt      timeout/retry
-ContextGovernor      routing           circuit breaker
-     │                  │             no-progress guard
-     └──────────────────┼──────────────────┘
-                        ▼
-                    Java Service
-                        │
-                 DB / External API
-
-全链路外面再包：
-Trace + Eval + Budget + Canary + Recovery
+User Request
+    ↓
+Tenant / User / Session Resolution
+    ↓
+Load Runtime State
+    ↓
+Context Budgeting
+ ├─ Recent turns
+ ├─ Summary
+ ├─ OpenViking memory/resource
+ └─ Tool schemas
+    ↓
+LLM Decision
+    ↓
+Tool Proposal
+    ↓
+Visibility / Schema / Policy / Rate Limit
+    ↓
+Duplicate / No-progress Guard
+    ↓
+Tool Runtime
+ ├─ timeout
+ ├─ retry budget
+ ├─ circuit breaker
+ ├─ bulkhead
+ └─ fallback
+    ↓
+Canonical ToolResult
+    ↓
+State Transition / Checkpoint
+    ↓
+Trace + Eval Event
+    ↓
+Next Iteration or Final
+    ↓
+Business Outcome Verification
+    ↓
+Golden Failure Mining / Replay
+    ↓
+Prompt / Model / Runtime Release
+    ↓
+Shadow / Canary / Rollback
 ```
 
-# 面试回答总纲
+这才是这 12 道题真正应该形成的知识体系。
 
-如果这 12 道题连续追问，可以始终回到一条工程主线：
+---
 
-> Agent 的核心难点不是“模型会不会回答”，而是怎么把一个概率性的多轮决策系统变成可观测、可归因、可限流、可恢复、可评测、可灰度的生产系统。性能问题靠分段 Trace 定位；Tool 失败先分类再决定 retry；死循环用 Runtime fingerprint 和 budget 硬拦截；Session/Memory 按 tenant/user/session scope 隔离；Token 和 Memory 都通过分层 Context 治理；所有模型/Prompt 改动最终都要经过 Golden Replay、Shadow 和 Canary，而不是凭主观感觉上线。
+# 14. 四个项目在这组题里分别应该怎么用
+
+## nanobot
+
+最适合讲：
+
+```text
+AgentRunner
+ContextGovernor
+Tool execution
+AgentHook
+repeated external lookup guard
+iteration budget
+checkpoint/recovery
+```
+
+它回答的是：
+
+> **一次 Tool-using Agent Run 在 Runtime 里面到底怎么跑。**
+
+不要把平台级多租户、完整熔断、业务 Exactly-once 都说成 nanobot 当前已经原生解决。
+
+## AgentDock
+
+当前项目非常适合讲：
+
+```text
+multi-tenant workspace
+agent/container lifecycle
+Task/Event Stream
+persistent workspace
+Driver Registry
+usage dashboard
+iteration/token/elapsed observation
+Docker resource isolation
+egress proxy
+Postgres durable control-plane state
+```
+
+它回答的是：
+
+> **怎么把一批 Agent Runtime 运营成一个真正的平台。**
+
+## OpenViking
+
+当前 README 明确是 Context Database，并提供：
+
+```text
+viking://
+Resource / Memory / Skill
+L0 / L1 / L2
+Session → Memory extraction
+create / merge / skip
+```
+
+它回答的是：
+
+> **长期 Context 怎么组织、检索、分层加载和演化。**
+
+## Pi 类 Harness
+
+更适合作为“Agent Harness / Coding Agent Runtime”的对照案例，用来解释：
+
+```text
+Session
+Operation
+Tool effect
+Recovery
+Context/Tool extensibility
+```
+
+但面试时不要为了显得项目多，把所有问题都硬套 Pi；只有涉及 Runtime/Harness、长任务、Tool Effect、Session 生命周期时再引用。
+
+---
+
+# 15. 这组题真正应该记住的 10 句话
+
+1. **Agent 性能看的是每个成功任务的总 Loop 成本，不是单次 LLM latency。**
+2. **Eval 必须同时看 Outcome、Trajectory、Safety、Efficiency。**
+3. **Agent 版本是 Model + Prompt + Tool Schema + Context/RAG/Memory + Runtime 的组合。**
+4. **Retry 前先分类，副作用 Timeout 应进入 UNKNOWN，而不是盲目 FAILED。**
+5. **故障归因必须保留从 Model Input 到 Business Outcome 的完整因果链。**
+6. **无效 Tool 需要 Tool Visibility、Budget、Fingerprint、Bulkhead、Rate Limit 多层治理。**
+7. **Redis 更适合 Hot State/协调，不应该直接等同于长期 Memory 或业务事实库。**
+8. **Session、Memory、RAG、Tool、Business Service 每一层都必须携带 tenant/user scope。**
+9. **Memory 的首要问题是写入质量和冲突治理，不是向量库容量。**
+10. **max_iterations 只是保险丝，真正防死循环要做 repeated-action + no-progress detection。**
+
+---
+
+# 16. 面试时如何把这组题回答出“高级工程感”
+
+不要一上来堆名词：
+
+```text
+Redis
+RAG
+OTel
+Circuit Breaker
+Vector DB
+```
+
+更好的回答顺序永远是：
+
+```text
+先说问题的根因
+    ↓
+再定义状态/指标
+    ↓
+再讲 Runtime 约束
+    ↓
+再讲失败路径
+    ↓
+最后拿真实项目代码/架构做验证
+```
+
+例如问 Tool 死循环：
+
+错误回答：
+
+> 设置最大迭代次数 10。
+
+更好的回答：
+
+> 我会分三层处理。第一层对 `tool_name + normalized_args + state_version` 做 exact fingerprint，阻止完全重复；第二层维护 evidence/state/error 的 progress fingerprint，即使参数略变但连续几轮没有新增证据也判定 `NO_PROGRESS`；第三层才是 max_iterations/max_tool_calls/deadline/cost 这种总 Budget。nanobot 当前源码里已经有 repeated external lookup guard，这是第一层的真实实现；语义级 no-progress 和跨 Tool budget 则可以在 Harness/AgentDock 平台层继续补。
+
+这种回答才能真正体现你理解的是 **Agent Runtime Engineering**，而不是只背 Agent 框架 API。
