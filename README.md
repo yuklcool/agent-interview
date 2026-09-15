@@ -11,6 +11,7 @@
 - [2026 Agent 面试补充：Workflows vs Autonomous Agents、Orchestrator-Workers、Reflection](docs/supplement-2026-agent-design-patterns-02.md)
 - [2026 Agent 面试补充：Java/Spring、Redis、MySQL 索引、意图识别、RAG、向量库、Tool Calling](docs/supplement-2026-java-backend-rag-tooling.md)
 - [2026 Agent 面试补充：Agent Loop、Tool Schema、Workflow、Context Compaction、Badcase 与版本发布](docs/supplement-2026-agent-runtime-production-03.md)
+- [2026 RAG 生产面试补充：语义分块、复杂 PDF、多路召回、ReRank、知识时效与低质量 Query](06-rag-retrieval/supplement-rag-production-2026.md)
 
 这些补充题来自最新截图题库，但不会因为问法不同就重复增加核心题号；先与现有 01～08 章节做语义去重，再作为高频追问入口补充深度答案。
 
