@@ -1,0 +1,175 @@
+name: Rewrite Q6 tool governance once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rewrite-q6-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  rewrite-q6:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Replace Q6 with authoritative deep-dive entry
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('docs/supplement-2026-runtime-reliability-eval-memory-04.md')
+          text = path.read_text(encoding='utf-8')
+          start = text.index('# Q6. 大量无效 Tool 调用会拉高成本、拖慢 QPS，做过哪些限流与拦截机制？')
+          end = text.index('# Q7. Redis 在 Agent 系统中到底存什么？', start)
+
+          replacement = r'''# Q6. 大量无效 Tool 调用会拉高成本、拖慢 QPS，做过哪些限流与拦截机制？
+
+> **这道题已经重新按生产级 Tool Governance 方式整理。权威深度版见：**
+> [大量无效 Tool 调用怎么治理：从 Tool 暴露、重复检测、Budget 到下游保护](../03-tools-mcp/tool-call-governance-deep-dive.md)
+
+## 核心判断
+
+这题不能只回答“加限流 + `max_tool_calls`”。大量无效 Tool 调用通常至少来自四类问题：
+
+```text
+Should-not-call   本来不需要 Tool，却调用了
+Wrong-tool        该调 A，却选了 B
+Duplicate-call    当前状态没变化，却重复同一动作
+No-progress-call  参数虽然变化，但没有获得新证据/新状态
+```
+
+因此生产治理要分层：
+
+```text
+User Request
+    ↓
+① Tool Exposure / Candidate Selection
+    ↓
+LLM Tool Proposal
+    ↓
+② Schema / Permission / Business Precondition
+    ↓
+③ Duplicate / No-progress Guard
+    ↓
+④ Run Budget + Tenant/User/Tool Rate Limit
+    ↓
+⑤ Bulkhead + Circuit Breaker + Timeout
+    ↓
+Tool Execution
+    ↓
+Canonical ToolResult
+    ↓
+Observation → 下一轮 LLM
+```
+
+### Action Fingerprint 是什么
+
+这里的 `Action Fingerprint` **不是 MCP、nanobot 或 LangChain 的标准协议概念**，而是一个 Runtime 去重实现技巧，也可以直接叫 `ActionKey / DedupKey / Tool Call Signature`。
+
+它表示：
+
+> **在当前状态和权限范围内，这个 Agent 是否已经执行过同一个逻辑动作。**
+
+例如：
+
+```text
+ActionKey =
+    tool_name
+  + normalized_args
+  + execution_scope
+  + relevant_state_version
+```
+
+需要紧凑保存时再做：
+
+```text
+fingerprint = SHA256(ActionKey)
+```
+
+Hash 不是核心，**稳定、正确地定义“同一个逻辑动作”才是核心**。
+
+为什么要加 `state_version`？例如 `query_order(1001)` 在订单状态从 `PAYING` 变成 `PAID` 后再次查询是合法的；如果只按 `tool_name + args` 去重，会把这次合法刷新错误拦掉。
+
+为什么要加 `execution_scope`？多租户系统里两个 Tenant 都可能查询 `device_id=1001`，不能因为参数一样就跨租户共享去重状态。
+
+### Action Fingerprint 不能替代 Idempotency Key
+
+```text
+Action Fingerprint / DedupKey
+→ Runtime 内防止 Agent Loop 重复动作
+
+Idempotency Key
+→ 业务服务确保退款/创建订单等副作用重复到达时仍只产生一次业务效果
+
+Rate Limit
+→ 保护系统容量
+
+Cache Key
+→ 复用查询结果
+```
+
+这四个概念不能混用。
+
+### Fingerprint 还不够，还要 No-progress Detection
+
+模型可能连续：
+
+```text
+search("上海酒店")
+search("上海的酒店")
+search("上海住宿")
+```
+
+三个 Fingerprint 都不同，但任务没有前进。因此还要看：
+
+```text
+state_version 是否变化
+evidence_count 是否增加
+subgoal 是否完成
+result/error class 是否变化
+```
+
+连续多轮都没有变化时进入：
+
+```text
+NO_PROGRESS
+   ↓
+换 Tool / 换 Provider / 扩大约束
+   ↓
+询问用户
+   ↓
+Fallback
+   ↓
+Graceful Stop
+```
+
+### nanobot 当前真实实现
+
+当前 `nanobot/agent/tools/execution.py` 在真正执行 Tool 前会调用 `repeated_external_lookup_error(...)`；命中后不会继续 `tool.execute()`，而是返回 `repeated external lookup blocked` Observation 给模型。
+
+这可以作为 Runtime Guard 的真实案例，但不要夸大成“nanobot 已实现完整 Action Fingerprint / Semantic No-progress Engine”。企业级还需要继续补 canonical args、state-aware dedup、per-tool budget、tenant quota、provider circuit breaker 等能力。
+
+### 面试口述版
+
+> 我不会只靠 QPS 限流治理无效 Tool Call，因为问题可能发生在不同层。首先按领域、角色和权限减少模型可见 Tool；模型提出 Tool Call 后，Runtime 再做 Schema、权限、业务前置和风险校验。重复动作可以用一个运行时 DedupKey，也就是所谓 Action Fingerprint，本质上是 `tool_name + canonical args + scope + relevant state version`，用于判断当前状态下是否已经做过同一动作，它不是标准协议，更不能替代业务幂等。然后我会加 `max_tool_calls/max_calls_per_tool/deadline/cost` 等 Run Budget，按 tenant/user/provider/tool 做 Rate Limit 和 Semaphore，下游再用 Bulkhead、Circuit Breaker 和统一 Retry Ownership 防止雪崩。对于参数不断变化但没有新证据的情况，还要做 No-progress Detection。nanobot 当前已经有 repeated external lookup guard，可以用作这一思路的实际源码案例。
+
+---
+
+'''
+
+          path.write_text(text[:start] + replacement + text[end:], encoding='utf-8')
+
+      - name: Commit rewrite
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/supplement-2026-runtime-reliability-eval-memory-04.md
+          if ! git diff --cached --quiet; then
+            git commit -m "docs: rewrite Q6 invalid tool-call governance"
+            git push
+          fi
