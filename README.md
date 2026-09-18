@@ -6,6 +6,8 @@
 
 ## 最新补充
 
+- [多 Agent 协作一致性：从任务分发到生产级收敛](02-planning-routing-multi-agent/multi-agent-consistency-deep-dive.md)
+- [ACP 名称歧义：Agent Client Protocol 与 Agent Communication Protocol](02-planning-routing-multi-agent/acp-protocols-deep-dive.md)
 - [2026 Agent 面试补充：Agent 架构 vs Chain、ReAct、Long-term Memory](docs/supplement-2026-agent-core-concepts-01.md)
 - [2026 Agent 面试补充：Multi-Agent Systems（协作模式、无限循环、通信冗余）](02-planning-routing-multi-agent/supplement-mas-2026.md)
 - [2026 Agent 面试补充：Workflows vs Autonomous Agents、Orchestrator-Workers、Reflection](docs/supplement-2026-agent-design-patterns-02.md)
