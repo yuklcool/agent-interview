@@ -13,12 +13,11 @@
 - [代表性深度答案：KV Cache、FlashAttention、RAG、MCP、Tool Retry](13-ai-engineering-full-question-bank/01-deep-answer-samples.md)
 - [答案编写规范与章节映射](13-ai-engineering-full-question-bank/02-answer-writing-guide.md)
 
-## zero2Agent Agent 面试题来源整理
+## zero2Agent Agent 面试通关原始内容
 
-新增独立目录，按来源网站 17 个章节收录 757 道明确标为“Q：”的面试题，以及公司偏好章的 11 条代表性问题。保留原问法、章节顺序和逐题来源定位；这一目录是题目索引，原作者的详细解析请从来源链接阅读。
+独立目录完整收录来源项目「Agent 面试通关」模块的首页和 17 个章节原始 Markdown，包含全部题目、每题的“新手答／高手答”、工程示例、表格与原文中的来源说明；同时保留上游 MIT 许可证。该目录是全文源文件，不是题目目录或外链清单。
 
-- [题库导航、计数和来源说明](14-zero2agent-interview-question-bank/README.md)
-- [768 条完整 Markdown 总索引](14-zero2agent-interview-question-bank/00-all-768-questions.md)
+- [查看原始章节文件](14-zero2agent-interview-question-bank/learn-agent-interview/)
 
 ## 最新补充
 
