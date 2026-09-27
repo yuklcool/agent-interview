@@ -12,7 +12,7 @@ PTQ 用代表性校准集把已训权重/激活映射低 bit，成本低；QAT �
 
 ## APPLE-03｜Estimate the KV-cache memory for a 3B on-device model at 4k context, and name the levers that shrink it.
 
-公式 `2×层数×KV头数×头维×4096×每元素字节`；具体 3B 架构未给，先查层数与 GQA 配置。假设 28 层、8 KV 头、128 维、BF16，约 235MB（十进制），并发/系统缓存另计。缩小 KV 头、INT8/INT4 KV、滑窗/分块、短上下文、前缀淘汰需测试长依赖质量。
+公式 `2×层数×KV头数×头维×4096×每元素字节`；具体 3B 架构未给，先查层数与 GQA 配置。假设 28 层、8 KV 头、128 维、BF16，约 470MB（十进制），并发/系统缓存另计。缩小 KV 头、INT8/INT4 KV、滑窗/分块、短上下文、前缀淘汰需测试长依赖质量。
 
 ## APPLE-04｜Time-to-first-token for your on-device feature is 1.8 s. Walk me through diagnosing and fixing it.
 
