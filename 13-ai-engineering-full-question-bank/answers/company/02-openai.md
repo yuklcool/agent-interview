@@ -227,3 +227,234 @@ flowchart TD
 ```
 
 以故障注入 eval 验证 429、5xx、超时、重复调用、权限撤销和取消，且每个用户只看自身允许的工具/数据。
+
+
+## OAI-16｜How would you build an LLM-powered enterprise search system?
+
+**分类**：AI 系统设计。
+
+### 回答
+
+企业搜索先明确语料类型、权限和更新率。连接器增量拉取原件与 ACL，解析/OCR/切块并保留 doc ID、版本、来源 span，写入 BM25、向量索引与元数据。查询时解析用户身份和组，检索前过滤租户/ACL，融合候选后再授权复核、精排和引用生成；权限撤销要短时传播或查询时 fail-closed。不能在检索出未授权文本后才让模型“不要说”。
+
+```mermaid
+flowchart LR
+    S[Sources and ACL changes] --> I[Parse chunk version]
+    I --> X[Keyword and vector indexes]
+    U[User identity and query] --> P[Policy prefilter]
+    P --> R[Hybrid retrieval]
+    X --> R
+    R --> A[ACL recheck]
+    A --> C[Context and citations]
+```
+
+指标分检索 Recall@k、答案支持率、越权测试、索引滞后、p99 与成本。失败时返回可解释的无证据或权限不足，不能编造答案。
+
+
+## OAI-17｜Design the serving stack for a ChatGPT-scale consumer assistant: hundreds of millions of weekly users, streaming chat, multiple model tiers.
+
+**分类**：AI 系统设计。
+
+### 回答
+
+先算峰值而非周活跃：并发流、平均输入/输出 token、长尾长度、地区和模型 tier 比例。区域入口做鉴权、配额、会话路由；控制面维护模型路由、灰度、预算；推理池分别管 prefill、decode、continuous batching、KV 和弹性扩容；会话事件与工具副作用在持久层记录，GPU 实例不当唯一状态源。
+
+```mermaid
+flowchart TD
+    U[Regional clients] --> G[Edge auth and quotas]
+    G --> S[(Session event store)]
+    G --> R[Model tier router]
+    R --> P[Prefill GPU pools]
+    P --> D[Decode pools with KV]
+    D --> V[Streaming response]
+    D --> M[Usage trace and billing]
+```
+
+容量按目标 SLO 下每 GPU 的可持续 tokens/s 而非理论 FLOPs 算，加冗余和长短混合压测。故障覆盖部分流输出、客户端重试、GPU 失联和跨区；读写工具另有权限与幂等。
+
+
+## OAI-18｜Design and build a webhook delivery system that reliably delivers events to customer-registered URLs.
+
+**分类**：AI 系统设计。
+
+### 回答
+
+Webhook 投递是至少一次语义：事件入事务性 outbox，dispatcher 读取并为每个订阅者生成 delivery ID、目标 URL、签名、attempt 与 next_retry；worker 限速投递，2xx 才确认，429/5xx/网络失败按 Retry-After 与指数退避重试，永久 4xx 或过期进 dead letter。用户端通过 event ID 去重；服务端不承诺跨所有目标的全局严格顺序，若需要按对象顺序则分区/序列号。
+
+```mermaid
+flowchart LR
+    E[Business transaction] --> O[(Outbox)]
+    O --> Q[Delivery queue]
+    Q --> W[Worker with signature and timeout]
+    W --> C[Customer URL]
+    C --> A[ACK or retry schedule]
+    A --> D[Delivery log and dead letter]
+```
+
+防 SSRF、DNS rebinding、内网目标和凭据泄露；签名含时间戳并支持密钥轮换。指标是延迟分布、最终成功率、重复投递、死信与单客户积压。
+
+
+## OAI-19｜Design a system to schedule jobs in a distributed environment.
+
+**分类**：AI 系统设计。
+
+### 回答
+
+分布式调度分 schedule owner 与执行 worker。任务表保存 id、run_at、payload、状态、租约、attempt、幂等键；调度器按时间索引扫描到期任务并原子 claim，发布到队列，worker 带 fencing token 执行并回写。调度器多副本用分区所有权或数据库原子 claim，避免重复派发；但崩溃仍可能导致至少一次执行，任务逻辑必须幂等。
+
+周期任务要定义 fixed-rate/fixed-delay、时区/DST、错过执行补偿；任务取消和重试需状态机。监控 scheduled-to-start 延迟、执行成功率、租约超时、重复执行和死信；故障演练在 claim 后、执行成功回执前、数据库故障各点杀进程。
+
+
+## OAI-20｜Design an in-memory database. / Design Slack.
+
+**分类**：AI 系统设计。
+
+### 回答
+
+题目同时提内存数据库/Slack，应先问面试官选择哪个并确定验收范围。内存数据库设计参见键值 store：WAL、MVCC/事务、索引、TTL、快照恢复和并发读写；先做单节点最小契约，再谈复制与一致性。Slack 设计则拆消息写入、频道成员授权、持久事件、扇出/在线推送、离线通知、搜索与多设备游标；消息顺序通常按频道有序而非全局有序。
+
+```mermaid
+flowchart LR
+    C[Client] --> A[Auth and channel policy]
+    A --> M[Message write with sequence]
+    M --> L[(Durable log)]
+    L --> F[Online fan-out]
+    L --> S[Search index and offline sync]
+```
+
+两者不能在面试中含糊混答；先锁定非功能要求如 QPS、持久性、跨区、权限，再做容量和失败路径。
+
+
+## OAI-21｜A customer says “the model got worse” after you upgraded model versions in their deployment. How do you verify and respond?
+
+**分类**：评测与可观测性。
+
+### 回答
+
+先建立升级前后同一批真实请求的配对比较，保存模型、prompt、工具 schema、检索索引、解码参数和业务数据版本；确认升级是否只改了模型。对投诉样本分桶：事实性、遵循格式、工具调用、拒答、长上下文、语言和延迟。固定 gold/专家判据与可回放环境复测，不用一次主观对话判断。
+
+给客户 24 小时内说明已复现范围、缓解方案（路由回旧版/灰度回退/特定任务固定模型）与后续实验；对重大安全/业务错误立即回滚。回归门禁按任务切片和严重度设置，允许用户反馈成为新测试集，但避免仅针对几例提示词过拟合。
+
+
+## OAI-22｜An enterprise customer reports that responses from your deployed system have gotten slow. Walk me through the diagnosis.
+
+**分类**：评测与可观测性。
+
+### 回答
+
+把慢请求分解为入口排队、鉴权、RAG 连接器/检索/精排、模型排队、prefill、decode、工具网络、出口。收集同时间段前后 trace，按 prompt/output 长度、QPS、租户、区域、模型/硬件、缓存命中、429 与重试切片；总平均不够，要看 TTFT、ITL/TPOT 和 p95/p99。模型没变也可能是长 prompt 比例增加、prefix cache 失效、KV 抢占或外部工具变慢。
+
+```text
+total latency = queue + retrieval + prefill + decode + tools + network
+```
+
+用固定流量回放隔离配置/负载，GPU 监控看利用率、HBM、KV blocks、preemption 和 CPU 调度。先回滚导致回归的版本或限流降级，并说明恢复指标与根因验证。
+
+
+## OAI-23｜How do you approach GenAI safety in consumer products?
+
+**分类**：安全、Security 与负责任 AI。
+
+### 回答
+
+消费产品要按风险类别设计分层控制：直接危险内容、隐私泄露、虚假高风险建议、未成年人场景、工具越权、滥用成本。模型层训练/拒答、入口风险分类、出口核查、工具权限/人审和用户申诉各有作用；输出过滤无法撤销已执行动作。策略版本与例外应可审计，避免系统提示词成为唯一安全边界。
+
+指标除拒答率，还要看严重错误漏报、误杀、有用性、群体差异和真实投诉。灰度发布对高严重度用硬门禁；事故发生可按版本回滚、限制工具范围并回放 trace。
+
+
+## OAI-24｜How would you design safeguards for an AI system that can take actions on behalf of a user?
+
+**分类**：安全、Security 与负责任 AI。
+
+### 回答
+
+Agent 代表用户行动时，用用户身份委托的最小权限令牌，按资源/动作/时限授权；模型只提议，Runtime 校验参数、目的地、业务前置条件和风险。高风险写入提供精确预览与人审，批准绑定动作哈希和有效期；执行记录幂等键、operation ID 与业务回执。超时进入 UNKNOWN 后查询状态，不能盲重试。
+
+```mermaid
+flowchart TD
+    M[Model proposal] --> P[User scope and policy]
+    P --> V[Exact action preview]
+    V --> H{Approval if risky}
+    H -- yes --> E[Idempotent execution]
+    H -- no --> X[Cancel]
+    E --> R[Business receipt and audit]
+```
+
+撤权、用户取消、参数变更使先前批准失效。用对抗性网页/邮件和跨租户数据做端到端测试，确保 prompt injection 即使成功影响模型，也无法越过工具门禁。
+
+
+## OAI-25｜An enterprise customer says: “We want AI to automate our claims processing.” You're the engineer in the room. What do the first two weeks look like?
+
+**分类**：应用与 Forward-Deployed 场景。
+
+### 回答
+
+前两周先做业务发现而非直接训练模型。第 1～3 天梳理理赔类型、现有 SOP、合法数据来源、人工权限、错误成本和量化基线；第 4～7 天选一个低风险子流程（材料分类/字段抽取/证据摘要），建立带人工审核的样本集和严重错误清单；第 2 周做最小试点，串起文档解析、规则核验、异常转人工与审计，不直接自动拒赔/付款。
+
+验收看字段级正确率、漏件、人工复核时间、严重错误和用户申诉；预算/合规由客户确定。每个建议保留原文页码与版本，敏感数据按租户隔离。试点结果用对照组验证工时节省，明确不自动化的边界和扩展条件。
+
+
+## OAI-26｜Do you have experience working with APIs? Are you used to working with C-suite executives?
+
+**分类**：应用与 Forward-Deployed 场景。
+
+### 回答框架
+
+API 经历用真实接口说明：鉴权、幂等、分页、速率限制、错误分类、版本兼容、观察与回滚，描述自己负责的接口契约和上线问题。C-suite 交流不需装作所有技术细节都适合高管；先将目标翻译成业务指标、风险、时间和决策选项，再备技术附录给实施团队。若没有直接向 C-suite 汇报经历，明确说明与谁沟通过、自己做的资料/演示和实际结果。
+
+可用 AgentDock 或照明运维项目的真实经验举例，但不要编造职级和成交结果。回答结构是对象→决策问题→你给的选项与证据→对方选择→交付结果。
+
+
+## OAI-27｜What is your favourite product and why?
+
+**分类**：行为面试与文化。
+
+### 回答框架
+
+选你长期使用、能具体剖析的产品，而非追热门。结构：用户任务与核心体验→一个设计细节如何降低摩擦→产品指标的可验证假设→失败或不满意之处→你会做的实验。若选开发工具，可从任务恢复、错误透明、权限确认与反馈闭环切入；若选照明运维平台，可谈对话式任务计划如何体现业务状态。
+
+避免把个人偏好直接当市场事实，区分“我观察到”与“我推测”；在批评时给可衡量的改进方案。
+
+
+## OAI-28｜Tell me about a time you made a mistake.
+
+**分类**：行为面试与文化。
+
+### 回答框架
+
+用真实错误讲背景、当时掌握的证据、自己的判断、影响、止损、根因、机制改进与后续结果。选择有技术细节和责任的例子，例如错误的事件去重条件、工具超时被当失败、缓存权限版本遗漏等；只用你实际发生的案例，不照搬这些假设。数字和时间可用准确范围，不虚构。
+
+面试官通常追问“你为何当时没看出来”“谁发现”“如何避免复发”。回答要能指出新增的测试、指标、评审或回滚门槛，并说明它是否在后来起作用。
+
+
+## OAI-29｜Tell me about a time you had a conflict with someone. How did you resolve it and what did you learn?
+
+**分类**：行为面试与文化。
+
+### 回答框架
+
+具体描述冲突的共同目标与差异假设，而不是说对方“不懂技术”。先听对方限制，提出可验证方案和决策标准，例如 UI 全面重构的交付周期与增量迭代风险；用小实验、用户数据或原型把争议转成证据。若最终不是你的方案，说明如何执行团队决定并监测风险。
+
+结果包括关系修复和产品/工程影响；反思自己的沟通方式。避免把技术分歧包装成个人胜利或泄露同事隐私。
+
+
+## OAI-30｜Tell me about a time you had conflicting priorities with stakeholders and how you secured alignment.
+
+**分类**：行为面试与文化。
+
+### 回答框架
+
+列出冲突优先级的利益相关方、不可移动的约束与可调整范围。建立统一的目标/成本/风险表，例如用户权限修复、MCP 入口和 UI 重构分别对安全、可用性、交付日期的影响；拿方案 A/B 与验收指标让决策者取舍。把决定写成可执行里程碑、负责人和依赖，后续用进度/风险更新避免再次分歧。
+
+强调你个人推动的沟通与技术验证，而不只是“大家开会达成一致”。若牺牲了某些需求，说明如何保护核心目标与何时复评。
+
+
+## OAI-31｜What is the project you are most proud of?
+
+**分类**：行为面试与文化。
+
+### 回答框架
+
+选择你参与最深、能解释技术决策和业务结果的项目。按目标→制约→架构/实现→最难故障→验收数字→个人贡献讲述。你可以选照明智能体的事件闭环/一路一策研究，或 AgentDock 多租户运行平台，但只陈述已经真实实现和测过的部分；设计稿、计划和上线结果必须区分。
+
+准备架构图与一次请求链路、权限/失败路径、两个重要 trade-off 和可证伪指标。面试官追问“你具体写了什么”时给模块/接口和测试证据，不只讲产品愿景。
