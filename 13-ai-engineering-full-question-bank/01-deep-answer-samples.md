@@ -47,7 +47,7 @@ M_KV = 2 × L × B × S × H_kv × D_h × b bytes
 - 滑动窗口限制可见历史，减少缓存同时也改变可访问信息。
 - Prefix Cache 只复用严格相同的前缀；缓存键应包含模型版本、适配器、位置编码和租户边界。
 
-## INF-005：FlashAttention FLOPs 没明显减少，为什么更快？
+## LLM-005：FlashAttention FLOPs 没明显减少，为什么更快？
 
 传统精确 Attention 的一个瓶颈是把 N×N 的注意力分数/概率矩阵在 HBM 与片上存储之间反复读写。FlashAttention 以 IO-aware 分块方式加载 Q/K/V，在 SRAM/shared memory 中完成小块矩阵运算，并使用在线 softmax 累计结果，避免物化整张注意力矩阵。主导 FLOPs 仍近似 O(N²D)，但 HBM 流量和中间张量峰值会明显下降。
 
