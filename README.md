@@ -6,11 +6,11 @@
 
 ## 跨公司 AI Engineering 全量题库
 
-新增独立目录，收录 598 道按技术主题与公司整理的原始面试题，并提供带 Mermaid 图的深度答案样板。它扩展现有 Agent 工程知识库，且会复用已完成的 104 道 Agent 深度题章节，避免重复维护。
+独立目录收录按技术主题与公司整理的 598 道原题及 **598 道逐题中文答案**（119 道跨公司高频题、479 道公司专项题）。答案按原题顺序可追溯，覆盖算法思路、工程取舍、失败路径与适用的 Mermaid 图；Agent 主题可结合已完成的 104 道深度章节进一步学习。
 
-- [题库目录与阅读说明](13-ai-engineering-full-question-bank/README.md)
+- [598 道逐题答案导航与阅读说明](13-ai-engineering-full-question-bank/README.md)
 - [598 道全量原题索引](13-ai-engineering-full-question-bank/00-all-598-questions.md)
-- [深度答案样板：KV Cache、FlashAttention、RAG、MCP、Tool Retry](13-ai-engineering-full-question-bank/01-deep-answer-samples.md)
+- [代表性深度答案：KV Cache、FlashAttention、RAG、MCP、Tool Retry](13-ai-engineering-full-question-bank/01-deep-answer-samples.md)
 - [答案编写规范与章节映射](13-ai-engineering-full-question-bank/02-answer-writing-guide.md)
 
 ## 最新补充
