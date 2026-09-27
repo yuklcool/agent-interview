@@ -4,6 +4,15 @@
 
 这不是“题目 + 标准答案”题库，而是一套以 **运行机制、状态机、源码、失败路径、真实项目和企业落地** 为核心的 Agent Engineering 学习手册。
 
+## 跨公司 AI Engineering 全量题库
+
+新增独立目录，收录 598 道按技术主题与公司整理的原始面试题，并提供带 Mermaid 图的深度答案样板。它扩展现有 Agent 工程知识库，且会复用已完成的 104 道 Agent 深度题章节，避免重复维护。
+
+- [题库目录与阅读说明](13-ai-engineering-full-question-bank/README.md)
+- [598 道全量原题索引](13-ai-engineering-full-question-bank/00-all-598-questions.md)
+- [深度答案样板：KV Cache、FlashAttention、RAG、MCP、Tool Retry](13-ai-engineering-full-question-bank/01-deep-answer-samples.md)
+- [答案编写规范与章节映射](13-ai-engineering-full-question-bank/02-answer-writing-guide.md)
+
 ## 最新补充
 
 - [多 Agent 协作一致性：从任务分发到生产级收敛](02-planning-routing-multi-agent/multi-agent-consistency-deep-dive.md)
